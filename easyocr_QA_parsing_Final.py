@@ -1,0 +1,854 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""QA parser using EasyOCR for text extraction.
+
+This script mirrors the flow-based chunking approach of
+``pdfplumber_QA_parsing_Final.py`` but replaces PDF text extraction with
+EasyOCR. Subject detection is removed – every detected chunk inside the
+column bounding boxes is parsed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import unicodedata
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import easyocr
+import numpy as np
+import pdfplumber
+from PIL import Image
+
+# =========================
+# Helpers
+# =========================
+
+def list_pdfs(folder: str) -> List[str]:
+    try:
+        items = sorted(
+            [
+                os.path.join(folder, f)
+                for f in os.listdir(folder)
+                if f.lower().endswith(".pdf") and os.path.isfile(os.path.join(folder, f))
+            ]
+        )
+    except Exception:
+        items = []
+    return items
+
+
+def ensure_dir(path: str):
+    if path and not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+
+
+def norm_space(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
+def _normalize_visible_text(s: str) -> str:
+    s = unicodedata.normalize("NFC", s or "")
+    s = re.sub(r"[\u00A0\u2000-\u200B]", " ", s)
+    s = (
+        s.replace("ㆍ", "·")
+        .replace("∙", "·")
+        .replace("・", "·")
+        .replace("•", "·")
+    )
+    return s
+
+
+# =========================
+# Option / question regex helpers
+# =========================
+OPTION_RANGES = [
+    (0x2460, 0x2473),  # ①-⑳
+    (0x2474, 0x2487),  # ⑴-⒇
+    (0x2488, 0x249B),  # ⒈-⒛
+    (0x24F5, 0x24FE),  # ⓵-⓾
+]
+OPTION_EXTRA = {0x24EA, 0x24FF, 0x24DB}  # ⓪, ⓿, ⓛ
+OPTION_SET = {
+    chr(cp)
+    for start, end in OPTION_RANGES
+    for cp in range(start, end + 1)
+}
+OPTION_SET.update(chr(cp) for cp in OPTION_EXTRA)
+OPTION_CLASS = "".join(sorted(OPTION_SET))
+QUESTION_CIRCLED_RANGE = f"{OPTION_CLASS}{chr(0x3250)}-{chr(0x32FF)}"
+
+OPT_SPLIT_RE = re.compile(rf"(?=([{OPTION_CLASS}]))")
+CIRCLED_STRIP_RE = re.compile(rf"^[{OPTION_CLASS}]\s*")
+QUESTION_START_LINE_RE = re.compile(
+    rf"^\s*(?:[{QUESTION_CIRCLED_RANGE}]|[0-9]{{1,3}}[.)]|제\s*[0-9]{{1,3}}\s*문)",
+    re.MULTILINE,
+)
+QUESTION_NUM_RE = re.compile(
+    r"^\s*(?:\(\s*(\d{1,3})\s*\)|(\d{1,3})\s*번|(\d{1,3}))\s*[.)]?\s*"
+)
+
+DISPUTE_RE = re.compile(
+    r"\(?\s*다툼이\s*(?:있는\s*경우|있으면)\s*(?P<site>[^)\n]*?)\s*(?:판례|결정)\s*에\s*의함\)?",
+    re.IGNORECASE,
+)
+
+LEADING_HEADER_STRIP = re.compile(
+    r"^\s*(?:[【\[]\s*[^】\]]+\s*[】\]])\s*(?:\([^)]*\))?\s*"
+)
+
+
+def _strip_header_garbage(text: str) -> str:
+    return norm_space(LEADING_HEADER_STRIP.sub("", text or ""))
+
+
+def infer_year_from_filename(path: str) -> Optional[int]:
+    fname = os.path.basename(path)
+    m = re.search(r"(\d{2})년", fname)
+    if m:
+        return 2000 + int(m.group(1))
+    m = re.search(r"(20\d{2}|19\d{2})", fname)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+# =========================
+# EasyOCR extraction
+# =========================
+@dataclass
+class OCRSettings:
+    dpi: int = 300
+    languages: Sequence[str] = ("ko", "en")
+    gpu: bool = False
+
+
+class EasyOCRTextExtractor:
+    """Render PDF pages to images and run EasyOCR within bboxes."""
+
+    def __init__(self, pdf: pdfplumber.pdf.PDF, settings: OCRSettings):
+        self.pdf = pdf
+        self.settings = settings
+        self.reader = easyocr.Reader(list(settings.languages), gpu=settings.gpu)
+        self._image_cache: Dict[int, Image.Image] = {}
+        self._scale = settings.dpi / 72.0
+
+    def _page_image(self, page_index: int) -> Image.Image:
+        if page_index not in self._image_cache:
+            pil = (
+                self.pdf.pages[page_index]
+                .to_image(resolution=int(self.settings.dpi))
+                .original.convert("RGB")
+            )
+            self._image_cache[page_index] = pil
+        return self._image_cache[page_index]
+
+    def extract_lines(
+        self,
+        page_index: int,
+        bbox: Tuple[float, float, float, float],
+        y_tol: float = 3.0,
+        y_cut: Optional[float] = None,
+        drop_zone: Optional[Tuple[float, float, float, float]] = None,
+    ) -> List[Dict[str, float]]:
+        x0, y0, x1, y1 = bbox
+        if y_cut is not None:
+            y0 = max(y0, y_cut)
+        if x1 <= x0 or y1 <= y0:
+            return []
+
+        scale = self._scale
+        im = self._page_image(page_index)
+        crop_box = (
+            int(round(x0 * scale)),
+            int(round(y0 * scale)),
+            int(round(x1 * scale)),
+            int(round(y1 * scale)),
+        )
+        if crop_box[2] - crop_box[0] <= 0 or crop_box[3] - crop_box[1] <= 0:
+            return []
+
+        crop = im.crop(crop_box)
+        np_img = np.array(crop)
+        results = self.reader.readtext(np_img)
+
+        entries = []
+        for pts, text, conf in results:
+            if not text:
+                continue
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            px0, px1 = min(xs), max(xs)
+            py0, py1 = min(ys), max(ys)
+            abs_x0 = x0 + px0 / scale
+            abs_x1 = x0 + px1 / scale
+            abs_y0 = y0 + py0 / scale
+            abs_y1 = y0 + py1 / scale
+            if drop_zone and _rects_intersect(
+                (abs_x0, abs_y0, abs_x1, abs_y1), drop_zone
+            ):
+                continue
+            entries.append(
+                {
+                    "x0": float(abs_x0),
+                    "x1": float(abs_x1),
+                    "top": float(abs_y0),
+                    "bottom": float(abs_y1),
+                    "text": _normalize_visible_text(text),
+                }
+            )
+
+        if not entries:
+            return []
+
+        entries.sort(key=lambda r: (r["top"], r["x0"]))
+        grouped: List[List[Dict[str, float]]] = []
+        cur: List[Dict[str, float]] = []
+        cur_top: Optional[float] = None
+        for item in entries:
+            top = item["top"]
+            if cur_top is None or abs(top - cur_top) <= y_tol:
+                cur.append(item)
+                cur_top = top if cur_top is None else cur_top
+            else:
+                grouped.append(cur)
+                cur = [item]
+                cur_top = top
+        if cur:
+            grouped.append(cur)
+
+        lines: List[Dict[str, float]] = []
+        for group in grouped:
+            gx0 = min(it["x0"] for it in group)
+            gx1 = max(it["x1"] for it in group)
+            gy0 = min(it["top"] for it in group)
+            gy1 = max(it["bottom"] for it in group)
+            gtext = " ".join(it["text"] for it in group)
+            lines.append(
+                {
+                    "x0": gx0,
+                    "x1": gx1,
+                    "top": gy0,
+                    "bottom": gy1,
+                    "y": 0.5 * (gy0 + gy1),
+                    "text": gtext,
+                }
+            )
+
+        lines.sort(key=lambda ln: (ln["top"], ln["x0"]))
+        return lines
+
+
+# =========================
+# Layout helpers
+# =========================
+
+def two_col_bboxes(page, top_frac=0.04, bottom_frac=0.96, gutter_frac=0.005):
+    w, h = float(page.width), float(page.height)
+    top = h * top_frac
+    bottom = h * bottom_frac
+    gutter = w * gutter_frac
+    mid = w * 0.5
+    return (0.0, top, mid - gutter, bottom), (mid + gutter, top, w, bottom)
+
+
+def _rects_intersect(a, b) -> bool:
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    return ax0 < bx1 and ax1 > bx0 and ay0 < by1 and ay1 > by0
+
+
+# =========================
+# Question detection
+# =========================
+
+def _extract_qnum_from_text(text: str) -> Optional[int]:
+    m = QUESTION_NUM_RE.match(text.strip())
+    if not m:
+        return None
+    raw = next((g for g in m.groups() if g), None)
+    if raw is None:
+        return None
+    try:
+        num = int(raw)
+    except Exception:
+        return None
+    if num >= 1000:
+        return None
+    return num
+
+
+def detect_question_starts(
+    lines: Sequence[Dict[str, float]],
+    margin_abs: Optional[float],
+    col_left: float,
+    tol: float = 1.0,
+    last_qnum: Optional[int] = None,
+) -> Tuple[List[int], Optional[int]]:
+    starts: List[int] = []
+    target_rel = None if margin_abs is None else (margin_abs - col_left)
+    current_last = last_qnum
+    for i, ln in enumerate(lines):
+        raw_text = ln.get("text") or ""
+        stripped = raw_text.lstrip()
+        if not stripped:
+            continue
+        if stripped[0] in OPTION_SET:
+            continue
+        text = stripped.rstrip()
+        rel = ln["x0"] - col_left
+        left_ok = True if target_rel is None else abs(rel - target_rel) <= tol
+        text_ok = bool(QUESTION_START_LINE_RE.match(text))
+        if not text_ok:
+            continue
+        qnum = _extract_qnum_from_text(text)
+        seq_ok = qnum is not None and (
+            current_last is None or qnum == current_last + 1
+        )
+        if left_ok or seq_ok:
+            starts.append(i)
+            if qnum is not None:
+                current_last = qnum
+    return starts, current_last
+
+
+# =========================
+# Chunk building
+# =========================
+
+def build_flow_segments(
+    pdf: pdfplumber.pdf.PDF,
+    extractor: EasyOCRTextExtractor,
+    top_frac: float,
+    bottom_frac: float,
+    gutter_frac: float,
+    y_tol: float,
+    clip_mode: str,
+    ycut_map: Dict[int, Optional[float]],
+    band_map: Dict[int, Optional[Tuple[float, float, float, float]]],
+):
+    segs = []
+    for i, page in enumerate(pdf.pages):
+        L, R = two_col_bboxes(page, top_frac, bottom_frac, gutter_frac)
+        ycut = ycut_map.get(i + 1) if clip_mode == "ycut" else None
+        band = band_map.get(i + 1) if clip_mode == "band" else None
+        L_lines = extractor.extract_lines(i, L, y_tol=y_tol, y_cut=ycut, drop_zone=band)
+        R_lines = extractor.extract_lines(i, R, y_tol=y_tol, y_cut=ycut, drop_zone=band)
+        segs.append((i, "L", L, L_lines))
+        segs.append((i, "R", R, R_lines))
+    return segs
+
+
+def flow_chunk_all_pages(
+    pdf: pdfplumber.pdf.PDF,
+    extractor: EasyOCRTextExtractor,
+    L_rel_offset: Optional[float],
+    R_rel_offset: Optional[float],
+    y_tol: float,
+    tol: float,
+    top_frac: float,
+    bottom_frac: float,
+    gutter_frac: float,
+    clip_mode: str,
+    ycut_map: Dict[int, Optional[float]],
+    band_map: Dict[int, Optional[Tuple[float, float, float, float]]],
+):
+    segs = build_flow_segments(
+        pdf,
+        extractor,
+        top_frac,
+        bottom_frac,
+        gutter_frac,
+        y_tol,
+        clip_mode,
+        ycut_map,
+        band_map,
+    )
+
+    seg_meta = []
+    for (pi, col, bbox, lines) in segs:
+        L, R = two_col_bboxes(pdf.pages[pi], top_frac, bottom_frac, gutter_frac)
+        if col == "L":
+            margin_abs = None if L_rel_offset is None else (L[0] + L_rel_offset)
+            col_left = L[0]
+        else:
+            margin_abs = None if R_rel_offset is None else (R[0] + R_rel_offset)
+            col_left = R[0]
+        seg_meta.append((pi, col, bbox, lines, margin_abs, col_left))
+
+    seg_starts = []
+    last_detected_qnum = None
+    for (pi, col, bbox, lines, m_abs, col_left) in seg_meta:
+        starts, last_detected_qnum = detect_question_starts(
+            lines, m_abs, col_left, tol=tol, last_qnum=last_detected_qnum
+        )
+        seg_starts.append(starts)
+
+    chunks = []
+    current = None
+    for seg_idx, (pi, col, bbox, lines, m_abs, col_left) in enumerate(seg_meta):
+        starts = set(seg_starts[seg_idx])
+        i = 0
+        while i < len(lines):
+            if i in starts:
+                if current is not None:
+                    chunks.append(current)
+                current = {
+                    "pieces": [],
+                    "start": {"page": pi, "col": col, "line_idx": i},
+                }
+            if current is not None:
+                next_mark = min((j for j in starts if j > i), default=None)
+                end_idx = (next_mark - 1) if next_mark is not None else (len(lines) - 1)
+                block = lines[i : end_idx + 1]
+                if block:
+                    x0 = min(l["x0"] for l in block)
+                    x1 = max(l["x1"] for l in block)
+                    top = min(l["top"] for l in block) - 2.0
+                    bot = max(l["bottom"] for l in block) + 2.0
+                    text = "\n".join(l["text"] for l in block)
+                    current["pieces"].append(
+                        {
+                            "page": pi,
+                            "col": col,
+                            "box": {"x0": x0, "x1": x1, "top": top, "bottom": bot},
+                            "start_line": i,
+                            "end_line": end_idx,
+                            "text": text,
+                        }
+                    )
+                i = end_idx + 1
+            else:
+                i += 1
+    if current is not None:
+        chunks.append(current)
+
+    per_page_boxes = {i: [] for i in range(len(pdf.pages))}
+    for ch_id, ch in enumerate(chunks, start=1):
+        for p in ch.get("pieces", []):
+            b = p["box"].copy()
+            b["chunk_id"] = ch_id
+            b["col"] = p["col"]
+            per_page_boxes[p["page"]].append(b)
+
+    return chunks, per_page_boxes
+
+
+# =========================
+# QA extraction helpers
+# =========================
+
+def parse_dispute(stem: str, keep_text: bool = True):
+    if not stem:
+        return False, None, stem
+    m = DISPUTE_RE.search(stem)
+    if not m:
+        return False, None, norm_space(stem)
+    site = norm_space(m.group("site") or "")
+    if keep_text:
+        return True, (site or None), norm_space(stem)
+    new_stem = norm_space(DISPUTE_RE.sub("", stem))
+    return True, (site or None), new_stem
+
+
+def sanitize_chunk_text(text: str, expected_next: Optional[int]) -> str:
+    text = _normalize_visible_text(text)
+    text = _strip_header_garbage(text)
+    if expected_next is not None:
+        text = re.sub(
+            rf"^\s*(?:문제\s*)?{expected_next}\s*[.)]?\s*",
+            "",
+            text.strip(),
+            flags=re.MULTILINE,
+        )
+    return text
+
+
+def extract_qa_from_chunk_text(text: str):
+    text = norm_space(text)
+    m = QUESTION_START_LINE_RE.search(text)
+    if m:
+        text = text[m.start() :]
+    mnum = QUESTION_NUM_RE.match(text)
+    detected_qnum = None
+    if mnum:
+        detected_qnum = next((g for g in mnum.groups() if g), None)
+        if detected_qnum is not None:
+            detected_qnum = int(detected_qnum)
+        text = text[mnum.end() :]
+
+    if "①" not in text and "②" not in text and "③" not in text and "④" not in text:
+        return None, None, False, None, detected_qnum
+
+    parts = re.split(r"\s*[①②③④⑤⑥⑦⑧⑨⑩]", text)
+    if len(parts) < 2:
+        return None, None, False, None, detected_qnum
+
+    stem = norm_space(parts[0])
+    opts_blob = text[len(parts[0]) :]
+    dispute, dispute_site, stem = parse_dispute(stem)
+    stem = norm_space(stem)
+
+    parts_split = [p for p in OPT_SPLIT_RE.split(opts_blob) if p]
+    options = []
+    i = 0
+    while i < len(parts_split):
+        sym = parts_split[i].strip()
+        if sym and sym[0] in OPTION_SET:
+            raw_txt = parts_split[i + 1] if (i + 1) < len(parts_split) else ""
+            clean_txt = norm_space(CIRCLED_STRIP_RE.sub("", raw_txt))
+            options.append({"index": sym[0], "text": clean_txt})
+            i += 2
+        else:
+            i += 1
+    options = [o for o in options if o["index"] in OPTION_SET]
+    if not options:
+        return None, None, dispute, dispute_site, detected_qnum
+
+    return stem, options, dispute, dispute_site, detected_qnum
+
+
+# =========================
+# Chunk preview images
+# =========================
+
+def save_chunk_preview(
+    page,
+    bbox,
+    preview_dir,
+    page_index,
+    column_tag,
+    chunk_idx_in_column,
+    global_idx,
+    dpi=220,
+    pad=2.0,
+):
+    if not bbox or not preview_dir:
+        return None
+    abs_dir = os.path.abspath(os.path.expanduser(preview_dir))
+    os.makedirs(abs_dir, exist_ok=True)
+    width, height = float(page.width), float(page.height)
+    x0, top, x1, bottom = map(float, bbox)
+    pad = max(0.0, float(pad))
+    padded = (
+        max(0.0, x0 - pad),
+        max(0.0, top - pad),
+        min(width, x1 + pad),
+        min(height, bottom + pad),
+    )
+    cropped = page.within_bbox(padded)
+    img = cropped.to_image(resolution=int(dpi))
+    pil = img.original.convert("RGB")
+    del img
+    fn = f"p{page_index:03d}_{column_tag}{chunk_idx_in_column:02d}_{global_idx:04d}.jpg"
+    out_path = os.path.join(abs_dir, fn)
+    pil.save(out_path, format="JPEG", quality=90)
+    pil.close()
+    return os.path.abspath(out_path)
+
+
+# =========================
+# Top-level parse
+# =========================
+
+def pdf_to_qa_flow_chunks(
+    pdf_path: str,
+    year: int,
+    start_num: int,
+    L_rel: Optional[float],
+    R_rel: Optional[float],
+    tol: float,
+    top_frac: float = 0.04,
+    bottom_frac: float = 0.96,
+    gutter_frac: float = 0.005,
+    y_tol: float = 3.0,
+    clip_mode: str = "none",
+    chunk_preview_dir: Optional[str] = None,
+    chunk_preview_dpi: int = 220,
+    chunk_preview_pad: float = 2.0,
+    ocr_settings: Optional[OCRSettings] = None,
+):
+    if ocr_settings is None:
+        ocr_settings = OCRSettings()
+
+    out: List[Dict[str, object]] = []
+    last_assigned_qno = start_num - 1
+    global_idx = 0
+    preview_dir = (
+        os.path.abspath(os.path.expanduser(chunk_preview_dir))
+        if chunk_preview_dir
+        else None
+    )
+
+    with pdfplumber.open(pdf_path) as pdf:
+        extractor = EasyOCRTextExtractor(pdf, ocr_settings)
+        ycut_map: Dict[int, Optional[float]] = {}
+        band_map: Dict[int, Optional[Tuple[float, float, float, float]]] = {}
+
+        chunks, _ = flow_chunk_all_pages(
+            pdf,
+            extractor,
+            L_rel,
+            R_rel,
+            y_tol,
+            tol,
+            top_frac,
+            bottom_frac,
+            gutter_frac,
+            clip_mode=clip_mode,
+            ycut_map=ycut_map,
+            band_map=band_map,
+        )
+
+        for ch in chunks:
+            pieces = ch.get("pieces") or []
+            if not pieces:
+                continue
+            p1 = pieces[0]["page"] + 1
+
+            expected_next = (
+                last_assigned_qno + 1 if last_assigned_qno is not None else None
+            )
+            text = "\n".join(p["text"] for p in pieces if p.get("text"))
+            text = sanitize_chunk_text(text, expected_next)
+            stem, options, dispute, dispute_site, detected_qnum = (
+                extract_qa_from_chunk_text(text)
+            )
+            if stem is None or not options:
+                continue
+
+            if detected_qnum is not None:
+                qno = detected_qnum
+            elif expected_next is not None:
+                qno = expected_next
+            else:
+                qno = start_num
+            global_idx += 1
+
+            preview_path = None
+            if preview_dir:
+                b = pieces[0]["box"]
+                bbox = (b["x0"], b["top"], b["x1"], b["bottom"])
+                page = pdf.pages[pieces[0]["page"]]
+                preview_path = save_chunk_preview(
+                    page,
+                    bbox,
+                    preview_dir,
+                    p1,
+                    pieces[0]["col"],
+                    1,
+                    global_idx,
+                    dpi=chunk_preview_dpi,
+                    pad=chunk_preview_pad,
+                )
+
+            out.append(
+                {
+                    "year": year,
+                    "content": {
+                        "question_number": qno,
+                        "question_text": stem,
+                        "dispute_bool": bool(dispute),
+                        "dispute_site": dispute_site,
+                        "options": options,
+                        "source": {"pieces": pieces, "start_page": p1},
+                        **({"preview_image": preview_path} if preview_path else {}),
+                    },
+                }
+            )
+
+            last_assigned_qno = qno
+
+    return out
+
+
+# =========================
+# CLI helpers
+# =========================
+
+def _auto_detect_margins_for_pdf(
+    pdf_path: str, top_frac: float, bottom_frac: float, gutter_frac: float
+) -> Tuple[Optional[float], Optional[float]]:
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for pg in pdf.pages:
+                Lb, Rb = two_col_bboxes(pg, top_frac, bottom_frac, gutter_frac)
+
+                def first_x(bbox):
+                    sub = pg.within_bbox(bbox)
+                    xs = [c["x0"] for c in (sub.chars or []) if c.get("x0") is not None]
+                    if not xs:
+                        words = sub.extract_words(
+                            x_tolerance=3, y_tolerance=3, keep_blank_chars=False
+                        )
+                        xs = [w["x0"] for w in words if w.get("x0") is not None]
+                    return min(xs) if xs else None
+
+                lx = first_x(Lb)
+                rx = first_x(Rb)
+                if lx is not None and rx is not None:
+                    return float(lx - Lb[0]), float(rx - Rb[0])
+    except Exception:
+        pass
+    return None, None
+
+
+def process_single_pdf(
+    pdf_path: str,
+    out_path: str,
+    year: Optional[int],
+    start_num: int,
+    tol: float,
+    top_frac: float,
+    bottom_frac: float,
+    gutter_frac: float,
+    clip_mode: str,
+    margin_left: Optional[float],
+    margin_right: Optional[float],
+    preview_dir: Optional[str],
+    preview_dpi: int,
+    preview_pad: float,
+    ocr_settings: OCRSettings,
+):
+    if year is None:
+        year = infer_year_from_filename(pdf_path) or datetime.now().year
+
+    if margin_left is None or margin_right is None:
+        auto_l, auto_r = _auto_detect_margins_for_pdf(
+            pdf_path, top_frac, bottom_frac, gutter_frac
+        )
+        margin_left = margin_left if margin_left is not None else auto_l
+        margin_right = margin_right if margin_right is not None else auto_r
+
+    qa = pdf_to_qa_flow_chunks(
+        pdf_path=pdf_path,
+        year=year,
+        start_num=start_num,
+        L_rel=margin_left,
+        R_rel=margin_right,
+        tol=tol,
+        top_frac=top_frac,
+        bottom_frac=bottom_frac,
+        gutter_frac=gutter_frac,
+        y_tol=3.0,
+        clip_mode=clip_mode,
+        chunk_preview_dir=preview_dir,
+        chunk_preview_dpi=preview_dpi,
+        chunk_preview_pad=preview_pad,
+        ocr_settings=ocr_settings,
+    )
+
+    ensure_dir(os.path.dirname(os.path.abspath(out_path)))
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(qa, f, ensure_ascii=False, indent=2)
+
+    return qa
+
+
+# =========================
+# Main CLI
+# =========================
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    ap = argparse.ArgumentParser(
+        description="Parse QA pairs from exam PDFs using EasyOCR for text extraction."
+    )
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--pdf", help="Input single PDF file")
+    g.add_argument("--pdf-dir", help="Folder containing PDFs (non-recursive)")
+
+    ap.add_argument("--out", required=True, help="Output JSON path or folder")
+    ap.add_argument("--year", type=int, help="Year of the exam; inferred from filename if omitted")
+    ap.add_argument("--start-num", type=int, default=1, help="Starting question number")
+
+    ap.add_argument("--tol", type=float, default=1.0, help="Margin match tolerance (pt)")
+    ap.add_argument("--top-frac", type=float, default=0.04)
+    ap.add_argument("--bottom-frac", type=float, default=0.96)
+    ap.add_argument("--gutter-frac", type=float, default=0.005)
+
+    ap.add_argument(
+        "--clip-mode",
+        choices=["none", "band", "ycut"],
+        default="none",
+        help="Optional header clipping mode",
+    )
+    ap.add_argument("--margin-left", type=float, help="Left column margin offset (pt)")
+    ap.add_argument("--margin-right", type=float, help="Right column margin offset (pt)")
+
+    ap.add_argument("--chunk-preview-dir", help="Save JPEG previews of detected chunks")
+    ap.add_argument("--chunk-preview-dpi", type=int, default=220)
+    ap.add_argument("--chunk-preview-pad", type=float, default=2.0)
+
+    ap.add_argument(
+        "--easyocr-dpi", type=int, default=300, help="Rendering DPI for EasyOCR"
+    )
+    ap.add_argument(
+        "--easyocr-langs",
+        default="ko,en",
+        help="Comma-separated EasyOCR language codes",
+    )
+    ap.add_argument(
+        "--easyocr-gpu",
+        action="store_true",
+        help="Enable GPU acceleration for EasyOCR if available",
+    )
+
+    return ap
+
+
+def main():
+    ap = build_arg_parser()
+    args = ap.parse_args()
+
+    if args.pdf:
+        pdfs = [args.pdf]
+        out_paths = [args.out]
+        batch_mode = False
+    else:
+        pdfs = list_pdfs(args.pdf_dir)
+        if not pdfs:
+            print(f"[ERROR] No PDFs found in {args.pdf_dir}", file=sys.stderr)
+            sys.exit(2)
+        ensure_dir(args.out)
+        out_paths = [os.path.join(args.out, os.path.splitext(os.path.basename(p))[0] + ".json") for p in pdfs]
+        batch_mode = True
+        print(f"[INFO] Processing {len(pdfs)} PDFs from {args.pdf_dir}")
+
+    ocr_settings = OCRSettings(
+        dpi=args.easyocr_dpi,
+        languages=[lang.strip() for lang in args.easyocr_langs.split(",") if lang.strip()],
+        gpu=args.easyocr_gpu,
+    )
+
+    for pdf_path, out_path in zip(pdfs, out_paths):
+        print(f"[INFO] Processing {os.path.basename(pdf_path)} -> {out_path}")
+        qa = process_single_pdf(
+            pdf_path=pdf_path,
+            out_path=out_path,
+            year=args.year,
+            start_num=args.start_num,
+            tol=args.tol,
+            top_frac=args.top_frac,
+            bottom_frac=args.bottom_frac,
+            gutter_frac=args.gutter_frac,
+            clip_mode=args.clip_mode,
+            margin_left=args.margin_left,
+            margin_right=args.margin_right,
+            preview_dir=args.chunk_preview_dir,
+            preview_dpi=args.chunk_preview_dpi,
+            preview_pad=args.chunk_preview_pad,
+            ocr_settings=ocr_settings,
+        )
+        print(f"[INFO]   -> extracted {len(qa)} QA items")
+
+    if batch_mode:
+        print("[INFO] Batch finished")
+
+
+if __name__ == "__main__":
+    main()
