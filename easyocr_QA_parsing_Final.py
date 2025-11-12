@@ -123,7 +123,7 @@ def infer_year_from_filename(path: str) -> Optional[int]:
 # =========================
 @dataclass
 class OCRSettings:
-    dpi: int = 300
+    dpi: int = 800
     languages: Sequence[str] = ("ko", "en")
     gpu: bool = False
 
@@ -1060,7 +1060,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--chunk-preview-pad", type=float, default=2.0)
 
     ap.add_argument(
-        "--easyocr-dpi", type=int, default=300, help="Rendering DPI for EasyOCR"
+        "--easyocr-dpi", type=int, default=800, help="Rendering DPI for EasyOCR"
     )
     ap.add_argument(
         "--easyocr-langs",
