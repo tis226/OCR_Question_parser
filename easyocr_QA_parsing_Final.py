@@ -698,6 +698,263 @@ def _auto_detect_margins_for_pdf(
     return None, None
 
 
+def interactive_margin_selection(
+    pdf_path: str,
+    page_index: int,
+    top_frac: float,
+    bottom_frac: float,
+    gutter_frac: float,
+    render_dpi: int = 200,
+    initial_left: Optional[float] = None,
+    initial_right: Optional[float] = None,
+) -> Tuple[float, float]:
+    """Interactive GUI to pick left/right margins on a preview image."""
+
+    try:
+        import tkinter as tk
+        from tkinter import messagebox, ttk
+    except Exception as exc:  # pragma: no cover - Tkinter availability depends on env
+        raise RuntimeError("Tkinter is required for the margin selector") from exc
+
+    try:
+        from PIL import ImageTk
+    except Exception as exc:  # pragma: no cover - Pillow build specific
+        raise RuntimeError("Pillow ImageTk is required for the margin selector") from exc
+
+    if page_index < 0:
+        raise ValueError("page_index must be >= 0")
+
+    with pdfplumber.open(pdf_path) as pdf:
+        if page_index >= len(pdf.pages):
+            raise ValueError("page_index exceeds total page count")
+        page = pdf.pages[page_index]
+        L_bbox, R_bbox = two_col_bboxes(page, top_frac, bottom_frac, gutter_frac)
+        base_img = (
+            page.to_image(resolution=int(render_dpi)).original.convert("RGB")
+        )
+        base_w, base_h = base_img.size
+        pdf_w, pdf_h = float(page.width), float(page.height)
+
+    scale_x = base_w / pdf_w if pdf_w else 1.0
+    scale_y = base_h / pdf_h if pdf_h else 1.0
+
+    state = {
+        "zoom": 1.0,
+        "left_pdf_x": None if initial_left is None else (L_bbox[0] + initial_left),
+        "right_pdf_x": None if initial_right is None else (R_bbox[0] + initial_right),
+        "result": None,
+    }
+
+    root = tk.Tk()
+    root.title("Manual Margin Selector")
+
+    main_frame = ttk.Frame(root, padding=8)
+    main_frame.grid(row=0, column=0, sticky="nsew")
+    root.columnconfigure(0, weight=1)
+    root.rowconfigure(0, weight=1)
+
+    canvas = tk.Canvas(main_frame, background="#222", highlightthickness=0)
+    hbar = ttk.Scrollbar(main_frame, orient="horizontal", command=canvas.xview)
+    vbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+    canvas.configure(xscrollcommand=hbar.set, yscrollcommand=vbar.set)
+    canvas.grid(row=0, column=0, sticky="nsew")
+    hbar.grid(row=1, column=0, sticky="ew")
+    vbar.grid(row=0, column=1, sticky="ns")
+    main_frame.columnconfigure(0, weight=1)
+    main_frame.rowconfigure(0, weight=1)
+
+    controls = ttk.Frame(main_frame)
+    controls.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+    controls.columnconfigure(6, weight=1)
+
+    zoom_var = tk.DoubleVar(value=100.0)
+    zoom_display_var = tk.StringVar(value="100%")
+    selection_var = tk.StringVar(value="L")
+    status_var = tk.StringVar(value="Click inside a column to set a margin line.")
+
+    photo_cache = {"image": None}
+
+    def pdf_to_canvas_coords(x: float, y: float) -> Tuple[float, float]:
+        zoom = state["zoom"]
+        return x * scale_x * zoom, y * scale_y * zoom
+
+    def refresh_image(*_):
+        zoom = zoom_var.get() / 100.0
+        if zoom <= 0:
+            zoom = 0.1
+        state["zoom"] = zoom
+        disp_w = max(1, int(round(base_w * zoom)))
+        disp_h = max(1, int(round(base_h * zoom)))
+        resized = base_img.resize((disp_w, disp_h), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(resized)
+        photo_cache["image"] = photo
+        if "image_id" not in photo_cache:
+            photo_cache["image_id"] = canvas.create_image(0, 0, image=photo, anchor="nw")
+        else:
+            canvas.itemconfigure(photo_cache["image_id"], image=photo)
+        canvas.configure(scrollregion=(0, 0, disp_w, disp_h))
+        zoom_display_var.set(f"{zoom * 100:.0f}%")
+        draw_overlays()
+
+    def draw_overlays():
+        canvas.delete("overlay")
+        zoom = state["zoom"]
+        for tag, bbox, color in (
+            ("L", L_bbox, "#33aaff"),
+            ("R", R_bbox, "#ff9933"),
+        ):
+            x0, y0 = pdf_to_canvas_coords(bbox[0], bbox[1])
+            x1, y1 = pdf_to_canvas_coords(bbox[2], bbox[3])
+            canvas.create_rectangle(
+                x0,
+                y0,
+                x1,
+                y1,
+                outline=color,
+                width=max(1, int(2 * zoom)),
+                tags="overlay",
+            )
+        if state["left_pdf_x"] is not None:
+            x = pdf_to_canvas_coords(state["left_pdf_x"], L_bbox[1])[0]
+            y0 = pdf_to_canvas_coords(0, L_bbox[1])[1]
+            y1 = pdf_to_canvas_coords(0, L_bbox[3])[1]
+            canvas.create_line(
+                x,
+                y0,
+                x,
+                y1,
+                fill="#00ffff",
+                width=max(1, int(3 * zoom)),
+                tags="overlay",
+            )
+            canvas.create_text(
+                x + 6 * zoom,
+                y0 + 6 * zoom,
+                text=f"L: {state['left_pdf_x']:.1f} pt",
+                anchor="nw",
+                fill="#00ffff",
+                font=("TkDefaultFont", max(8, int(9 * zoom))),
+                tags="overlay",
+            )
+        if state["right_pdf_x"] is not None:
+            x = pdf_to_canvas_coords(state["right_pdf_x"], R_bbox[1])[0]
+            y0 = pdf_to_canvas_coords(0, R_bbox[1])[1]
+            y1 = pdf_to_canvas_coords(0, R_bbox[3])[1]
+            canvas.create_line(
+                x,
+                y0,
+                x,
+                y1,
+                fill="#ff66aa",
+                width=max(1, int(3 * zoom)),
+                tags="overlay",
+            )
+            canvas.create_text(
+                x + 6 * zoom,
+                y0 + 6 * zoom,
+                text=f"R: {state['right_pdf_x']:.1f} pt",
+                anchor="nw",
+                fill="#ff66aa",
+                font=("TkDefaultFont", max(8, int(9 * zoom))),
+                tags="overlay",
+            )
+
+    def on_click(event):
+        canvas.focus_set()
+        canvas_x = canvas.canvasx(event.x)
+        canvas_y = canvas.canvasy(event.y)
+        zoom = state["zoom"]
+        pdf_x = canvas_x / (scale_x * zoom)
+        pdf_y = canvas_y / (scale_y * zoom)
+        side = selection_var.get()
+        if side == "L":
+            if not (L_bbox[0] <= pdf_x <= L_bbox[2]):
+                status_var.set("Click inside the highlighted left column.")
+                return
+            state["left_pdf_x"] = pdf_x
+            status_var.set(f"Left margin set at x={pdf_x:.2f} pt (y={pdf_y:.2f})")
+        else:
+            if not (R_bbox[0] <= pdf_x <= R_bbox[2]):
+                status_var.set("Click inside the highlighted right column.")
+                return
+            state["right_pdf_x"] = pdf_x
+            status_var.set(f"Right margin set at x={pdf_x:.2f} pt (y={pdf_y:.2f})")
+        draw_overlays()
+
+    def on_key(event):
+        if event.char.lower() == "l":
+            selection_var.set("L")
+        elif event.char.lower() == "r":
+            selection_var.set("R")
+
+    def confirm():
+        if state["left_pdf_x"] is None or state["right_pdf_x"] is None:
+            messagebox.showwarning(
+                "Incomplete", "Set both left and right margins before continuing."
+            )
+            return
+        left_offset = state["left_pdf_x"] - L_bbox[0]
+        right_offset = state["right_pdf_x"] - R_bbox[0]
+        state["result"] = (left_offset, right_offset)
+        root.destroy()
+
+    def cancel():
+        state["result"] = None
+        root.destroy()
+
+    canvas.bind("<Button-1>", on_click)
+    canvas.bind("<Key>", on_key)
+    canvas.focus_set()
+    root.bind("<Key>", on_key)
+    root.protocol("WM_DELETE_WINDOW", cancel)
+
+    ttk.Label(controls, text="Zoom:").grid(row=0, column=0, sticky="w")
+    zoom_scale = ttk.Scale(
+        controls,
+        from_=50,
+        to=300,
+        orient="horizontal",
+        variable=zoom_var,
+        command=lambda _evt: refresh_image(),
+    )
+    zoom_scale.grid(row=0, column=1, sticky="ew", padx=(4, 12))
+    ttk.Label(controls, textvariable=zoom_display_var, width=6).grid(
+        row=0, column=2, sticky="w"
+    )
+
+    ttk.Label(controls, text="Select margin:").grid(row=0, column=3, padx=(8, 0))
+    ttk.Radiobutton(
+        controls, text="Left (L)", value="L", variable=selection_var
+    ).grid(row=0, column=4, padx=(4, 4))
+    ttk.Radiobutton(
+        controls, text="Right (R)", value="R", variable=selection_var
+    ).grid(row=0, column=5, padx=(4, 4))
+
+    ttk.Button(controls, text="Reset", command=lambda: reset_lines()).grid(
+        row=0, column=6, sticky="w"
+    )
+    ttk.Button(controls, text="Cancel", command=cancel).grid(
+        row=0, column=7, padx=(12, 4)
+    )
+    ttk.Button(controls, text="Apply", command=confirm).grid(row=0, column=8)
+
+    status = ttk.Label(main_frame, textvariable=status_var, anchor="w")
+    status.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
+    def reset_lines():
+        state["left_pdf_x"] = None
+        state["right_pdf_x"] = None
+        status_var.set("Margins cleared. Click to set new positions.")
+        draw_overlays()
+
+    refresh_image()
+    root.mainloop()
+
+    if state["result"] is None:
+        raise RuntimeError("Margin selection cancelled")
+    return state["result"]
+
+
 def process_single_pdf(
     pdf_path: str,
     out_path: str,
@@ -714,11 +971,29 @@ def process_single_pdf(
     preview_dpi: int,
     preview_pad: float,
     ocr_settings: OCRSettings,
+    margin_ui: bool = False,
+    margin_ui_page: int = 1,
+    margin_ui_dpi: int = 200,
 ):
     if year is None:
         year = infer_year_from_filename(pdf_path) or datetime.now().year
 
-    if margin_left is None or margin_right is None:
+    if margin_ui:
+        try:
+            margin_left, margin_right = interactive_margin_selection(
+                pdf_path=pdf_path,
+                page_index=max(0, margin_ui_page - 1),
+                top_frac=top_frac,
+                bottom_frac=bottom_frac,
+                gutter_frac=gutter_frac,
+                render_dpi=margin_ui_dpi,
+                initial_left=margin_left,
+                initial_right=margin_right,
+            )
+        except RuntimeError as exc:
+            print(f"[ERROR] Margin selector failed: {exc}", file=sys.stderr)
+            sys.exit(3)
+    elif margin_left is None or margin_right is None:
         auto_l, auto_r = _auto_detect_margins_for_pdf(
             pdf_path, top_frac, bottom_frac, gutter_frac
         )
@@ -798,6 +1073,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Enable GPU acceleration for EasyOCR if available",
     )
 
+    ap.add_argument(
+        "--margin-ui",
+        action="store_true",
+        help="Launch an interactive preview to pick left/right margins",
+    )
+    ap.add_argument(
+        "--margin-ui-page",
+        type=int,
+        default=1,
+        help="1-indexed page to preview when choosing margins",
+    )
+    ap.add_argument(
+        "--margin-ui-dpi",
+        type=int,
+        default=200,
+        help="Rendering DPI for the margin preview window",
+    )
+
     return ap
 
 
@@ -843,6 +1136,9 @@ def main():
             preview_dpi=args.chunk_preview_dpi,
             preview_pad=args.chunk_preview_pad,
             ocr_settings=ocr_settings,
+            margin_ui=args.margin_ui,
+            margin_ui_page=args.margin_ui_page,
+            margin_ui_dpi=args.margin_ui_dpi,
         )
         print(f"[INFO]   -> extracted {len(qa)} QA items")
 
