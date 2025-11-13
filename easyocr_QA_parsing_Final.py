@@ -2095,6 +2095,14 @@ def pdf_to_qa_flow_chunks(
                 except Exception:
                     manual_qno = None
 
+            if manual_only and not manual_info:
+                logger.debug(
+                    "Skipping chunk on page %d column %s: manual-only mode active and chunk lacks manual metadata.",
+                    pieces[0]["page"] + 1,
+                    pieces[0]["col"],
+                )
+                continue
+
             stem, options, dispute, dispute_site, detected_qnum = (
                 extract_qa_from_chunk_text(text, chunk_lines, ch.get("manual"))
             )
@@ -2121,6 +2129,13 @@ def pdf_to_qa_flow_chunks(
                         detected_qnum,
                     )
                 qno = manual_qno
+            elif manual_only:
+                logger.warning(
+                    "Manual-only mode skipping chunk on page %d column %s: no question number assigned.",
+                    pieces[0]["page"] + 1,
+                    pieces[0]["col"],
+                )
+                continue
             elif detected_qnum is not None:
                 qno = detected_qnum
             elif expected_next is not None:
