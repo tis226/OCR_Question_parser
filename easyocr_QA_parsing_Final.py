@@ -191,6 +191,9 @@ def _normalize_option_markers(text: str) -> str:
     def repl(match: re.Match) -> str:
         if match.start() == 0:
             return match.group(0)
+        prior = text[: match.start()]
+        if prior.strip() == "":
+            return match.group(0)
         num = match.group(1)
         circled = DIGIT_TO_CIRCLED.get(num)
         if not circled or circled == num:
@@ -202,6 +205,9 @@ def _normalize_option_markers(text: str) -> str:
 
     def prefix_repl(match: re.Match) -> str:
         lead, num = match.group(1), match.group(2)
+        prior = text[: match.start(2)]
+        if prior.strip() == "":
+            return match.group(0)
         circled = DIGIT_TO_CIRCLED.get(num)
         if not circled or circled == num:
             return match.group(0)
