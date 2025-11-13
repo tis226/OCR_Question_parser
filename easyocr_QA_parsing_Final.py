@@ -1957,6 +1957,7 @@ def pdf_to_qa_flow_chunks(
     chunk_debug_dir: Optional[str] = None,
     failed_chunk_log_chars: int = 240,
     manual_questions: Optional[Sequence[ManualQuestionRegion]] = None,
+    manual_only: bool = False,
 ):
     if ocr_settings is None:
         ocr_settings = OCRSettings()
@@ -2006,12 +2007,36 @@ def pdf_to_qa_flow_chunks(
             band_map=band_map,
         )
         auto_chunk_count = len(chunks)
+        manual_region_count = len(manual_questions or [])
+        if manual_only:
+            if manual_region_count:
+                logger.info(
+                    "Manual-only mode enabled: discarding %d auto-detected chunks in favor of %d manual regions.",
+                    auto_chunk_count,
+                    manual_region_count,
+                )
+            elif auto_chunk_count:
+                logger.info(
+                    "Manual-only mode enabled: discarding %d auto-detected chunks (no manual regions supplied).",
+                    auto_chunk_count,
+                )
+            else:
+                logger.info(
+                    "Manual-only mode enabled: no manual regions supplied, no automatic chunks available.",
+                )
+            chunks = []
         if manual_questions:
-            logger.info(
-                "Manual chunk selection provided %d regions; replacing %d automatic chunks.",
-                len(manual_questions),
-                auto_chunk_count,
-            )
+            if not manual_only:
+                logger.info(
+                    "Manual chunk selection provided %d regions; replacing %d automatic chunks.",
+                    manual_region_count,
+                    auto_chunk_count,
+                )
+            else:
+                logger.debug(
+                    "Manual-only mode building %d chunks from manual regions.",
+                    manual_region_count,
+                )
             chunks = build_manual_chunks_from_regions(
                 manual_questions,
                 page_text_map,
@@ -3412,6 +3437,7 @@ def process_single_pdf(
     crop_report_path: Optional[str] = None,
     expected_question_count: Optional[int] = None,
     fail_on_incomplete: bool = False,
+    manual_only: bool = False,
 ):
     if year is None:
         year = infer_year_from_filename(pdf_path) or datetime.now().year
@@ -3483,6 +3509,11 @@ def process_single_pdf(
                 len(manual_regions),
             )
 
+    if manual_only and not manual_regions:
+        logger.warning(
+            "Manual-only mode enabled but no manual regions were provided; no questions will be extracted."
+        )
+
     heartbeat = HeartbeatLogger(
         interval=heartbeat_interval,
         message=f"Still processing {os.path.basename(pdf_path)}...",
@@ -3510,6 +3541,7 @@ def process_single_pdf(
             chunk_debug_dir=chunk_debug_dir,
             failed_chunk_log_chars=failed_chunk_log_chars,
             manual_questions=manual_regions if manual_regions is not None else None,
+            manual_only=manual_only,
         )
     finally:
         heartbeat.stop()
@@ -3805,6 +3837,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     ap.add_argument(
+        "--manual-only",
+        action="store_true",
+        help="Skip automatic chunk detection and rely solely on manual annotations",
+    )
+
+    ap.add_argument(
         "--log-level",
         default=_parse_log_level("INFO"),
         type=_parse_log_level,
@@ -4077,6 +4115,7 @@ def main():
                 crop_report_path=crop_report_path,
                 expected_question_count=args.expected_question_count,
                 fail_on_incomplete=args.fail_on_incomplete,
+                manual_only=args.manual_only,
             )
         except RuntimeError as exc:
             logger.error("Validation failed for %s: %s", pdf_path, exc)
