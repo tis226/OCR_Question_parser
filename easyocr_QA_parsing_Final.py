@@ -143,6 +143,9 @@ OPTION_CLASS = "".join(sorted(OPTION_SET))
 QUESTION_CIRCLED_RANGE = f"{OPTION_CLASS}{chr(0x3250)}-{chr(0x32FF)}"
 
 ASCII_OPTION_RE = re.compile(r"(?<!\d)(?:\(|\[)?(1[0-9]|20|[1-9])\s*[).:]")
+ASCII_OPTION_PREFIX_RE = re.compile(
+    r"(?m)(\n)\s*(?:\(|\[)?(1[0-9]|20|[1-9])\s+(?=\S)"
+)
 DIGIT_TO_CIRCLED = {
     str(i): chr(0x2460 + i - 1) if 1 <= i <= 20 else str(i)
     for i in range(1, 21)
@@ -181,7 +184,16 @@ def _normalize_option_markers(text: str) -> str:
         trailing = " " if not match.group(0).endswith(" ") else ""
         return f"{circled}{trailing}"
 
-    return ASCII_OPTION_RE.sub(repl, text)
+    text = ASCII_OPTION_RE.sub(repl, text)
+
+    def prefix_repl(match: re.Match) -> str:
+        lead, num = match.group(1), match.group(2)
+        circled = DIGIT_TO_CIRCLED.get(num)
+        if not circled or circled == num:
+            return match.group(0)
+        return f"{lead}{circled} "
+
+    return ASCII_OPTION_PREFIX_RE.sub(prefix_repl, text)
 
 
 def infer_year_from_filename(path: str) -> Optional[int]:
