@@ -38,6 +38,15 @@ DEFAULT_TOP_FRAC = 0.10
 DEFAULT_BOTTOM_FRAC = 0.90
 DEFAULT_GUTTER_FRAC = 0.005
 
+DEFAULT_SEARCHABLE_FONT_CANDIDATES: Tuple[str, ...] = (
+    "HYGoThic-Medium",
+    "HYGothic-Medium",
+    "HYSMyeongJo-Medium",
+    "HeiseiKakuGo-W5",
+    "HeiseiMin-W3",
+    "STSong-Light",
+)
+
 # =========================
 # Helpers
 # =========================
@@ -994,16 +1003,79 @@ def save_rasterized_pdf(pdf_path: str, out_path: str, dpi: int) -> None:
                 pass
 
 
+def _resolve_searchable_font(
+    font_spec: Optional[str],
+    pdfmetrics,
+):
+    candidates: List[str] = []
+    if font_spec:
+        candidates.append(font_spec)
+    candidates.extend(DEFAULT_SEARCHABLE_FONT_CANDIDATES)
+    for candidate in candidates:
+        if not candidate:
+            continue
+        expanded = os.path.abspath(os.path.expanduser(candidate))
+        if os.path.isfile(expanded):
+            try:
+                from reportlab.pdfbase.ttfonts import TTFont  # type: ignore
+
+                alias = os.path.splitext(os.path.basename(expanded))[0]
+                pdfmetrics.registerFont(TTFont(alias, expanded))
+                logger.info(
+                    "Registered TrueType font %s for searchable PDF output", alias
+                )
+                return alias
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "Failed to register TrueType font %s: %s", expanded, exc
+                )
+                continue
+        try:
+            pdfmetrics.getFont(candidate)
+            return candidate
+        except KeyError:
+            try:
+                from reportlab.pdfbase.cidfonts import UnicodeCIDFont  # type: ignore
+
+                pdfmetrics.registerFont(UnicodeCIDFont(candidate))
+                logger.debug(
+                    "Registered CID font %s for searchable PDF output", candidate
+                )
+                return candidate
+            except KeyError:
+                logger.debug(
+                    "CID font %s not available in this ReportLab build", candidate
+                )
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "Failed to register CID font %s: %s", candidate, exc
+                )
+    try:
+        pdfmetrics.getFont("Helvetica")
+        logger.warning(
+            "Falling back to Helvetica for searchable PDF text layer; CJK glyphs may be missing"
+        )
+        return "Helvetica"
+    except KeyError:  # pragma: no cover - extremely unlikely
+        from reportlab.pdfbase.cidfonts import UnicodeCIDFont  # type: ignore
+
+        pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+        logger.warning(
+            "Falling back to STSong-Light for searchable PDF text layer"
+        )
+        return "STSong-Light"
+
+
 def save_searchable_pdf(
     pdf_path: str,
     out_path: str,
     dpi: int,
     page_text_map: Dict[int, List[Dict[str, object]]],
+    font_spec: Optional[str] = None,
 ) -> None:
     try:
         from reportlab.lib.utils import ImageReader
         from reportlab.pdfbase import pdfmetrics
-        from reportlab.pdfbase.cidfonts import UnicodeCIDFont
         from reportlab.pdfgen import canvas
     except ImportError as exc:  # pragma: no cover - optional dependency
         raise RuntimeError(
@@ -1013,11 +1085,7 @@ def save_searchable_pdf(
     abs_out = os.path.abspath(os.path.expanduser(out_path))
     ensure_dir(os.path.dirname(abs_out))
 
-    font_name = "HYGoThic-Medium"
-    try:
-        pdfmetrics.getFont(font_name)
-    except KeyError:
-        pdfmetrics.registerFont(UnicodeCIDFont(font_name))
+    font_name = _resolve_searchable_font(font_spec, pdfmetrics)
 
     with pdfplumber.open(pdf_path) as pdf:
         canv = canvas.Canvas(abs_out)
@@ -1714,6 +1782,7 @@ def process_single_pdf(
     raster_pdf_dpi: Optional[int] = None,
     searchable_pdf_path: Optional[str] = None,
     searchable_pdf_dpi: Optional[int] = None,
+    searchable_pdf_font: Optional[str] = None,
     bbox_overlay_pdf_path: Optional[str] = None,
     bbox_overlay_pdf_dpi: Optional[int] = None,
     text_out_path: Optional[str] = None,
@@ -1815,6 +1884,7 @@ def process_single_pdf(
             searchable_pdf_path,
             dpi,
             page_text_map,
+            font_spec=searchable_pdf_font,
         )
         logger.info("Saved searchable OCR PDF to %s", searchable_pdf_path)
     if bbox_overlay_pdf_path:
@@ -1928,6 +1998,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--searchable-pdf-dpi",
         type=int,
         help="DPI to use when rasterizing pages for the searchable PDF layer",
+    )
+    ap.add_argument(
+        "--searchable-pdf-font",
+        help=(
+            "Font name (CID) or path to a TTF/OTF file for the searchable PDF text layer"
+        ),
     )
     ap.add_argument(
         "--bbox-overlay-pdf-out",
@@ -2182,26 +2258,27 @@ def main():
                 year=args.year,
                 start_num=args.start_num,
                 tol=args.tol,
-            top_frac=args.top_frac,
-            bottom_frac=args.bottom_frac,
-            gutter_frac=args.gutter_frac,
-            clip_mode=args.clip_mode,
-            margin_left=args.margin_left,
-            margin_right=args.margin_right,
-            preview_dir=args.chunk_preview_dir,
-            preview_dpi=args.chunk_preview_dpi,
-            preview_pad=args.chunk_preview_pad,
-            ocr_settings=ocr_settings,
-            margin_ui=args.margin_ui,
-            margin_ui_page=args.margin_ui_page,
-            margin_ui_dpi=args.margin_ui_dpi,
-            heartbeat_interval=args.heartbeat_secs,
-            chunk_debug_dir=debug_dir,
-            failed_chunk_log_chars=args.failed_chunk_log_chars,
-            raster_pdf_path=raster_path,
-            raster_pdf_dpi=args.raster_pdf_dpi,
+                top_frac=args.top_frac,
+                bottom_frac=args.bottom_frac,
+                gutter_frac=args.gutter_frac,
+                clip_mode=args.clip_mode,
+                margin_left=args.margin_left,
+                margin_right=args.margin_right,
+                preview_dir=args.chunk_preview_dir,
+                preview_dpi=args.chunk_preview_dpi,
+                preview_pad=args.chunk_preview_pad,
+                ocr_settings=ocr_settings,
+                margin_ui=args.margin_ui,
+                margin_ui_page=args.margin_ui_page,
+                margin_ui_dpi=args.margin_ui_dpi,
+                heartbeat_interval=args.heartbeat_secs,
+                chunk_debug_dir=debug_dir,
+                failed_chunk_log_chars=args.failed_chunk_log_chars,
+                raster_pdf_path=raster_path,
+                raster_pdf_dpi=args.raster_pdf_dpi,
                 searchable_pdf_path=searchable_path,
                 searchable_pdf_dpi=args.searchable_pdf_dpi,
+                searchable_pdf_font=args.searchable_pdf_font,
                 bbox_overlay_pdf_path=bbox_overlay_path,
                 bbox_overlay_pdf_dpi=args.bbox_overlay_pdf_dpi,
                 text_out_path=text_path,
