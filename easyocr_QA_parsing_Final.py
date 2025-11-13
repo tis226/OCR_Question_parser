@@ -235,6 +235,11 @@ class OCRSettings:
     dpi: int = 800
     languages: Sequence[str] = ("ko", "en")
     gpu: bool = False
+    column_pad_x: float = 2.0
+    column_pad_top: float = 2.0
+    column_pad_bottom: float = 60.0
+    column_filter_top: float = 4.0
+    column_filter_bottom: float = 60.0
 
 
 class EasyOCRTextExtractor:
@@ -252,10 +257,15 @@ class EasyOCRTextExtractor:
         self._scale = settings.dpi / 72.0
         self.page_word_boxes: Dict[int, List[Dict[str, object]]] = {}
         logger.debug(
-            "Initialized EasyOCRTextExtractor: dpi=%s languages=%s gpu=%s",
+            "Initialized EasyOCRTextExtractor: dpi=%s languages=%s gpu=%s pads(x=%.1f top=%.1f bottom=%.1f) filters(top=%.1f bottom=%.1f)",
             settings.dpi,
             ",".join(settings.languages),
             settings.gpu,
+            settings.column_pad_x,
+            settings.column_pad_top,
+            settings.column_pad_bottom,
+            settings.column_filter_top,
+            settings.column_filter_bottom,
         )
 
     def _page_image(self, page_index: int) -> Image.Image:
@@ -278,22 +288,52 @@ class EasyOCRTextExtractor:
         drop_zone: Optional[Tuple[float, float, float, float]] = None,
         column_tag: Optional[str] = None,
     ) -> List[Dict[str, float]]:
+        page = self.pdf.pages[page_index]
+        page_width = float(page.width)
+        page_height = float(page.height)
         x0, y0, x1, y1 = bbox
         if y_cut is not None:
             y0 = max(y0, y_cut)
         if x1 <= x0 or y1 <= y0:
             return []
 
+        pad_x = max(0.0, float(getattr(self.settings, "column_pad_x", 0.0)))
+        pad_top = max(0.0, float(getattr(self.settings, "column_pad_top", 0.0)))
+        pad_bottom = max(0.0, float(getattr(self.settings, "column_pad_bottom", 0.0)))
+        orig_bbox = (x0, y0, x1, y1)
+        if pad_x or pad_top or pad_bottom:
+            padded_bbox = (
+                max(0.0, x0 - pad_x),
+                max(0.0, y0 - pad_top),
+                min(page_width, x1 + pad_x),
+                min(page_height, y1 + pad_bottom),
+            )
+            x0, y0, x1, y1 = padded_bbox
+        filter_top = max(
+            0.0,
+            orig_bbox[1]
+            - max(float(getattr(self.settings, "column_filter_top", 0.0)), pad_top),
+        )
+        filter_bottom = min(
+            page_height,
+            orig_bbox[3]
+            + max(float(getattr(self.settings, "column_filter_bottom", 0.0)), pad_bottom),
+        )
+
         scale = self._scale
         im = self._page_image(page_index)
         logger.debug(
-            "Extracting lines from page %d bbox=(%.1f, %.1f, %.1f, %.1f) scale=%.3f",
+            "Extracting lines from page %d bbox=(%.1f, %.1f, %.1f, %.1f) scale=%.3f (padded to %.1f, %.1f, %.1f, %.1f)",
             page_index + 1,
+            orig_bbox[0],
+            orig_bbox[1],
+            orig_bbox[2],
+            orig_bbox[3],
+            scale,
             x0,
             y0,
             x1,
             y1,
-            scale,
         )
         crop_box = (
             int(round(x0 * scale)),
@@ -321,6 +361,16 @@ class EasyOCRTextExtractor:
             abs_x1 = x0 + px1 / scale
             abs_y0 = y0 + py0 / scale
             abs_y1 = y0 + py1 / scale
+            mid_y = 0.5 * (abs_y0 + abs_y1)
+            if mid_y < filter_top or mid_y > filter_bottom:
+                logger.debug(
+                    "Skipping OCR word outside filter band: page=%d mid_y=%.1f filter=(%.1f, %.1f)",
+                    page_index + 1,
+                    mid_y,
+                    filter_top,
+                    filter_bottom,
+                )
+                continue
             if drop_zone and _rects_intersect(
                 (abs_x0, abs_y0, abs_x1, abs_y1), drop_zone
             ):
@@ -1985,6 +2035,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable GPU acceleration for EasyOCR if available",
     )
+    ap.add_argument(
+        "--easyocr-column-pad-x",
+        type=float,
+        default=2.0,
+        help="Horizontal padding (pt) added to each column crop before OCR",
+    )
+    ap.add_argument(
+        "--easyocr-column-pad-top",
+        type=float,
+        default=2.0,
+        help="Top padding (pt) added to each column crop before OCR",
+    )
+    ap.add_argument(
+        "--easyocr-column-pad-bottom",
+        type=float,
+        default=60.0,
+        help="Bottom padding (pt) added to each column crop before OCR",
+    )
+    ap.add_argument(
+        "--easyocr-column-filter-top",
+        type=float,
+        default=4.0,
+        help="Extra tolerance (pt) above the column window when keeping OCR words",
+    )
+    ap.add_argument(
+        "--easyocr-column-filter-bottom",
+        type=float,
+        default=60.0,
+        help="Extra tolerance (pt) below the column window when keeping OCR words",
+    )
 
     ap.add_argument(
         "--raster-pdf-out",
@@ -2211,6 +2291,11 @@ def main():
         dpi=args.easyocr_dpi,
         languages=[lang.strip() for lang in args.easyocr_langs.split(",") if lang.strip()],
         gpu=args.easyocr_gpu,
+        column_pad_x=args.easyocr_column_pad_x,
+        column_pad_top=args.easyocr_column_pad_top,
+        column_pad_bottom=args.easyocr_column_pad_bottom,
+        column_filter_top=args.easyocr_column_filter_top,
+        column_filter_bottom=args.easyocr_column_filter_bottom,
     )
 
     for (
