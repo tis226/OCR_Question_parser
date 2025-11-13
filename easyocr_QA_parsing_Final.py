@@ -20,7 +20,7 @@ import statistics
 import sys
 import threading
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -48,6 +48,31 @@ DEFAULT_SEARCHABLE_FONT_CANDIDATES: Tuple[str, ...] = (
     "HeiseiMin-W3",
     "STSong-Light",
 )
+
+
+@dataclass
+class ManualQuestionRegion:
+    """Container for a manually marked question and its option regions."""
+
+    id: int
+    page_index: int
+    rect: Tuple[float, float, float, float]
+    options_rect: Optional[Tuple[float, float, float, float]] = None
+    option_rects: Dict[int, Tuple[float, float, float, float]] = field(
+        default_factory=dict
+    )
+
+    def normalized_rect(self) -> Tuple[float, float, float, float]:
+        return _normalize_rect(self.rect)
+
+    def normalized_options_rect(self) -> Optional[Tuple[float, float, float, float]]:
+        if self.options_rect is None:
+            return None
+        return _normalize_rect(self.options_rect)
+
+    def iter_option_rects(self):
+        for idx, box in sorted(self.option_rects.items()):
+            yield idx, _normalize_rect(box)
 
 # =========================
 # Helpers
@@ -531,6 +556,23 @@ class EasyOCRTextExtractor:
 # Layout helpers
 # =========================
 
+
+def _normalize_rect(rect: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
+    x0, y0, x1, y1 = rect
+    return (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+
+
+def _rect_center(rect: Tuple[float, float, float, float]) -> Tuple[float, float]:
+    x0, y0, x1, y1 = _normalize_rect(rect)
+    return ((x0 + x1) * 0.5, (y0 + y1) * 0.5)
+
+
+def _point_in_rect(point: Tuple[float, float], rect: Tuple[float, float, float, float]) -> bool:
+    x, y = point
+    x0, y0, x1, y1 = _normalize_rect(rect)
+    return x0 <= x <= x1 and y0 <= y <= y1
+
+
 def two_col_bboxes(
     page,
     top_frac: float = DEFAULT_TOP_FRAC,
@@ -768,6 +810,130 @@ def flow_chunk_all_pages(
     return chunks, per_page_boxes, page_text_map
 
 
+def build_manual_chunks_from_regions(
+    manual_regions: Sequence[ManualQuestionRegion],
+    page_text_map: Dict[int, List[Dict[str, object]]],
+    pdf: pdfplumber.pdf.PDF,
+    top_frac: float,
+    bottom_frac: float,
+    gutter_frac: float,
+) -> List[Dict[str, object]]:
+    if not manual_regions:
+        return []
+
+    ordered = sorted(
+        manual_regions,
+        key=lambda region: (
+            region.page_index,
+            region.normalized_rect()[1],
+            region.normalized_rect()[0],
+            region.id,
+        ),
+    )
+    chunks: List[Dict[str, object]] = []
+
+    for region in ordered:
+        page_index = region.page_index
+        rect = region.normalized_rect()
+        options_rect = region.normalized_options_rect()
+        option_rects = {idx: box for idx, box in region.iter_option_rects()}
+        captured: List[Dict[str, object]] = []
+
+        for line in page_text_map.get(page_index, []):
+            x0 = _safe_float(line.get("x0"), 0.0)
+            x1 = _safe_float(line.get("x1"), 0.0)
+            top = _safe_float(line.get("top"), 0.0)
+            bottom = _safe_float(line.get("bottom"), 0.0)
+            midpoint = ((x0 + x1) * 0.5, (top + bottom) * 0.5)
+
+            area_tag: Optional[str] = None
+            for opt_idx, opt_rect in option_rects.items():
+                if _point_in_rect(midpoint, opt_rect):
+                    area_tag = f"option:{opt_idx}"
+                    break
+
+            if area_tag is None and options_rect and _point_in_rect(midpoint, options_rect):
+                area_tag = "options_block"
+
+            if area_tag is None and _point_in_rect(midpoint, rect):
+                area_tag = "stem"
+
+            if area_tag is None:
+                continue
+
+            copy_line = dict(line)
+            copy_line.setdefault("column", line.get("column"))
+            copy_line["manual_area"] = area_tag
+            captured.append(copy_line)
+
+        if not captured:
+            logger.warning(
+                "Manual region %s on page %d captured no OCR lines.",
+                region.id,
+                page_index + 1,
+            )
+            continue
+
+        captured.sort(key=lambda ln: (_safe_float(ln.get("top"), 0.0), _safe_float(ln.get("x0"), 0.0)))
+
+        text_parts = [str(ln.get("text") or "").strip() for ln in captured]
+        text = "\n".join(part for part in text_parts if part)
+        if not text.strip():
+            logger.warning(
+                "Manual region %s on page %d produced empty text and will be skipped.",
+                region.id,
+                page_index + 1,
+            )
+            continue
+
+        page = pdf.pages[page_index]
+        L_bbox, R_bbox = two_col_bboxes(page, top_frac, bottom_frac, gutter_frac)
+        center = _rect_center(rect)
+        if _point_in_rect(center, L_bbox):
+            col = "L"
+        elif _point_in_rect(center, R_bbox):
+            col = "R"
+        else:
+            col = "L" if center[0] <= float(page.width) * 0.5 else "R"
+
+        piece_lines: List[Dict[str, object]] = []
+        for line in captured:
+            clone = dict(line)
+            clone.setdefault("column", col)
+            piece_lines.append(clone)
+
+        chunk: Dict[str, object] = {
+            "pieces": [
+                {
+                    "page": page_index,
+                    "col": col,
+                    "box": {
+                        "x0": rect[0],
+                        "x1": rect[2],
+                        "top": rect[1],
+                        "bottom": rect[3],
+                    },
+                    "start_line": 0,
+                    "end_line": len(piece_lines) - 1,
+                    "text": text,
+                    "lines": piece_lines,
+                    "manual": True,
+                }
+            ],
+            "manual": {
+                "question_rect": rect,
+                "options_rect": options_rect,
+                "option_rects": option_rects,
+                "page_index": page_index,
+                "question_id": region.id,
+            },
+            "start": {"page": page_index, "col": col, "line_idx": 0},
+        }
+        chunks.append(chunk)
+
+    return chunks
+
+
 # =========================
 # QA extraction helpers
 # =========================
@@ -989,11 +1155,144 @@ def sanitize_chunk_text(text: str, expected_next_qnum: Optional[int]) -> str:
     return text
 
 
+def _extract_from_manual_annotations(
+    text: str,
+    lines: Optional[Sequence[Dict[str, object]]],
+    manual: Dict[str, object],
+):
+    if not manual or not lines:
+        return None
+
+    line_list = list(lines)
+    if not line_list:
+        return None
+
+    assignments: Dict[int, str] = {}
+    for idx, line in enumerate(line_list):
+        area = str(line.get("manual_area")) if line.get("manual_area") else None
+        if area:
+            assignments[idx] = area
+
+    option_rects_raw = manual.get("option_rects") or {}
+    option_rects: Dict[int, Tuple[float, float, float, float]] = {}
+    for key, rect in option_rects_raw.items():
+        try:
+            idx = int(key)
+        except Exception:
+            continue
+        option_rects[idx] = _normalize_rect(tuple(rect))
+
+    options_rect = manual.get("options_rect")
+    question_rect = manual.get("question_rect")
+    options_rect_tuple = (
+        _normalize_rect(tuple(options_rect)) if options_rect is not None else None
+    )
+    question_rect_tuple = (
+        _normalize_rect(tuple(question_rect)) if question_rect is not None else None
+    )
+
+    for idx, line in enumerate(line_list):
+        if idx in assignments:
+            continue
+        x0 = _safe_float(line.get("x0"), 0.0)
+        x1 = _safe_float(line.get("x1"), 0.0)
+        top = _safe_float(line.get("top"), 0.0)
+        bottom = _safe_float(line.get("bottom"), 0.0)
+        midpoint = ((x0 + x1) * 0.5, (top + bottom) * 0.5)
+
+        area = None
+        for opt_idx, rect in option_rects.items():
+            if _point_in_rect(midpoint, rect):
+                area = f"option:{opt_idx}"
+                break
+        if area is None and options_rect_tuple and _point_in_rect(midpoint, options_rect_tuple):
+            area = "options_block"
+        if area is None and question_rect_tuple and _point_in_rect(midpoint, question_rect_tuple):
+            area = "stem"
+        if area is not None:
+            assignments[idx] = area
+
+    stem_lines: List[Dict[str, object]] = []
+    block_lines: List[Dict[str, object]] = []
+    per_option_lines: Dict[int, List[Dict[str, object]]] = {}
+
+    for idx, line in enumerate(line_list):
+        tag = assignments.get(idx)
+        if tag is None or tag == "stem":
+            stem_lines.append(line)
+        elif isinstance(tag, str) and tag.startswith("option:"):
+            try:
+                opt_idx = int(tag.split(":", 1)[1])
+            except Exception:
+                continue
+            per_option_lines.setdefault(opt_idx, []).append(line)
+        elif tag == "options_block":
+            block_lines.append(line)
+        else:
+            stem_lines.append(line)
+
+    stem_text = "\n".join(
+        str(ln.get("text") or "").strip() for ln in stem_lines if str(ln.get("text") or "").strip()
+    )
+    if not stem_text.strip():
+        stem_text = norm_space(_normalize_visible_text(text or ""))
+
+    dispute, dispute_site, stem_text = parse_dispute(stem_text, keep_text=True)
+    stem_text = norm_space(stem_text)
+    detected_qnum, stem_text = extract_leading_qnum_and_clean(stem_text)
+    stem_text = norm_space(stem_text)
+
+    options: List[Dict[str, str]] = []
+    for opt_idx in sorted(per_option_lines):
+        opt_text = " ".join(
+            str(ln.get("text") or "").strip()
+            for ln in per_option_lines[opt_idx]
+            if str(ln.get("text") or "").strip()
+        )
+        opt_text = norm_space(opt_text)
+        if not opt_text:
+            continue
+        marker = DIGIT_TO_CIRCLED.get(str(opt_idx), str(opt_idx))
+        options.append({"index": marker, "text": opt_text})
+
+    if not options and block_lines:
+        block_text = "\n".join(
+            str(ln.get("text") or "").strip()
+            for ln in block_lines
+            if str(ln.get("text") or "").strip()
+        )
+        block_text = _normalize_option_markers(block_text)
+        parts = [p for p in OPT_SPLIT_RE.split(block_text) if p]
+        i = 0
+        while i < len(parts):
+            sym = parts[i].strip()
+            if sym and sym[0] in OPTION_SET:
+                raw_txt = parts[i + 1] if (i + 1) < len(parts) else ""
+                clean_txt = norm_space(CIRCLED_STRIP_RE.sub("", raw_txt))
+                options.append({"index": sym[0], "text": clean_txt})
+                i += 2
+            else:
+                i += 1
+        options = [opt for opt in options if opt["text"]]
+
+    if not options:
+        return None
+
+    return stem_text, options, dispute, dispute_site, detected_qnum
+
+
 def extract_qa_from_chunk_text(
-    text: str, lines: Optional[Sequence[Dict[str, object]]] = None
+    text: str,
+    lines: Optional[Sequence[Dict[str, object]]] = None,
+    manual: Optional[Dict[str, object]] = None,
 ):
     if not text:
         return None, None, False, None, None
+
+    if manual:
+        manual_result = _extract_from_manual_annotations(text, lines, manual)
+        if manual_result is not None:
+            return manual_result
 
     text = _normalize_option_markers(text)
     text = _strip_header_garbage(text)
@@ -1591,6 +1890,7 @@ def pdf_to_qa_flow_chunks(
     ocr_settings: Optional[OCRSettings] = None,
     chunk_debug_dir: Optional[str] = None,
     failed_chunk_log_chars: int = 240,
+    manual_questions: Optional[Sequence[ManualQuestionRegion]] = None,
 ):
     if ocr_settings is None:
         ocr_settings = OCRSettings()
@@ -1639,6 +1939,21 @@ def pdf_to_qa_flow_chunks(
             ycut_map=ycut_map,
             band_map=band_map,
         )
+        auto_chunk_count = len(chunks)
+        if manual_questions:
+            logger.info(
+                "Manual chunk selection provided %d regions; replacing %d automatic chunks.",
+                len(manual_questions),
+                auto_chunk_count,
+            )
+            chunks = build_manual_chunks_from_regions(
+                manual_questions,
+                page_text_map,
+                pdf,
+                top_frac,
+                bottom_frac,
+                gutter_frac,
+            )
         logger.info("Detected %d raw chunks before QA filtering", len(chunks))
 
         for idx, ch in enumerate(chunks, start=1):
@@ -1670,7 +1985,7 @@ def pdf_to_qa_flow_chunks(
                 chunk_lines.sort(key=lambda ln: (ln.get("top", 0.0), ln.get("x0", 0.0)))
 
             stem, options, dispute, dispute_site, detected_qnum = (
-                extract_qa_from_chunk_text(text, chunk_lines)
+                extract_qa_from_chunk_text(text, chunk_lines, ch.get("manual"))
             )
             if stem is None or not options:
                 snippet = text.strip().replace("\n", " ")
@@ -1775,6 +2090,547 @@ def _auto_detect_margins_for_pdf(
     except Exception:
         pass
     return None, None
+
+
+def interactive_chunk_selection(
+    pdf_path: str,
+    top_frac: float,
+    bottom_frac: float,
+    gutter_frac: float,
+    render_dpi: int = 200,
+) -> Optional[List[ManualQuestionRegion]]:
+    try:
+        import tkinter as tk
+        from tkinter import messagebox, ttk
+    except Exception as exc:  # pragma: no cover - depends on environment
+        raise RuntimeError("Tkinter is required for the chunk selector") from exc
+
+    try:
+        from PIL import ImageTk
+    except Exception as exc:  # pragma: no cover - Pillow build specific
+        raise RuntimeError("Pillow ImageTk is required for the chunk selector") from exc
+
+    pdf = pdfplumber.open(pdf_path)
+    try:
+        page_count = len(pdf.pages)
+        if page_count == 0:
+            raise RuntimeError("The PDF has no pages to annotate")
+
+            state: Dict[str, Any] = {
+                "zoom": 1.0,
+                "page_index": 0,
+                "base_img": None,
+                "base_w": None,
+                "base_h": None,
+                "scale_x": 1.0,
+                "scale_y": 1.0,
+                "L_bbox": None,
+                "R_bbox": None,
+                "questions": {},
+                "selected_qid": None,
+                "next_qid": 1,
+                "drag_start": None,
+                "drag_rect_id": None,
+                "draw_mode": ("question", None),
+                "shift_active": False,
+                "active_option_digit": None,
+                "result": None,
+            }
+    
+            root = tk.Tk()
+            root.title("Manual QA Chunk Selector")
+    
+        main_frame = ttk.Frame(root, padding=8)
+        main_frame.grid(row=0, column=0, sticky="nsew")
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(0, weight=1)
+    
+        canvas = tk.Canvas(main_frame, background="#1f1f1f", highlightthickness=0)
+        hbar = ttk.Scrollbar(main_frame, orient="horizontal", command=canvas.xview)
+        vbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+        canvas.configure(xscrollcommand=hbar.set, yscrollcommand=vbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        hbar.grid(row=1, column=0, sticky="ew")
+        vbar.grid(row=0, column=1, sticky="ns")
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.rowconfigure(0, weight=1)
+    
+        controls = ttk.Frame(main_frame)
+        controls.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        controls.columnconfigure(7, weight=1)
+    
+        status_var = tk.StringVar(value="Drag to mark questions. Hold Shift for option blocks.")
+        selection_var = tk.StringVar(value="None")
+        mode_var = tk.StringVar(value="Question")
+        page_info_var = tk.StringVar(value="Page 1 / %d" % page_count)
+        zoom_var = tk.DoubleVar(value=100.0)
+        zoom_display_var = tk.StringVar(value="100%")
+    
+        photo_cache: Dict[str, Any] = {}
+    
+        def pdf_to_canvas_coords(x: float, y: float) -> Tuple[float, float]:
+            zoom = state.get("zoom", 1.0)
+            return (
+                x * state.get("scale_x", 1.0) * zoom,
+                y * state.get("scale_y", 1.0) * zoom,
+            )
+    
+        def canvas_to_pdf_coords(x: float, y: float) -> Tuple[float, float]:
+            zoom = state.get("zoom", 1.0) or 1.0
+            return (
+                x / (state.get("scale_x", 1.0) * zoom),
+                y / (state.get("scale_y", 1.0) * zoom),
+            )
+    
+        def questions_for_page(page_index: int) -> List[ManualQuestionRegion]:
+            return state.setdefault("questions", {}).setdefault(page_index, [])
+    
+        def get_selected_question() -> Optional[ManualQuestionRegion]:
+            qid = state.get("selected_qid")
+            if qid is None:
+                return None
+            for q in questions_for_page(state["page_index"]):
+                if q.id == qid:
+                    return q
+            return None
+    
+        def update_selection_label():
+            sel = get_selected_question()
+            if sel is None:
+                selection_var.set("None")
+            else:
+                selection_var.set(f"Page {sel.page_index + 1} / ID {sel.id}")
+    
+        def update_mode_label():
+            mode, value = state.get("draw_mode", ("question", None))
+            active_digit = state.get("active_option_digit")
+            if mode == "option" and value:
+                mode_var.set(f"Option {value}")
+            elif active_digit:
+                mode_var.set(f"Option {active_digit}")
+            elif mode == "options_block":
+                mode_var.set("Options Block")
+            else:
+                mode_var.set("Question")
+    
+        def set_status(message: str):
+            status_var.set(message)
+    
+        def draw_overlays():
+            canvas.delete("overlay")
+            L_bbox = state.get("L_bbox")
+            R_bbox = state.get("R_bbox")
+            if L_bbox:
+                x0, y0 = pdf_to_canvas_coords(L_bbox[0], L_bbox[1])
+                x1, y1 = pdf_to_canvas_coords(L_bbox[2], L_bbox[3])
+                canvas.create_rectangle(
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    outline="#2a82da",
+                    width=1,
+                    dash=(4, 4),
+                    tags=("overlay", "column"),
+                )
+            if R_bbox:
+                x0, y0 = pdf_to_canvas_coords(R_bbox[0], R_bbox[1])
+                x1, y1 = pdf_to_canvas_coords(R_bbox[2], R_bbox[3])
+                canvas.create_rectangle(
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    outline="#da822a",
+                    width=1,
+                    dash=(4, 4),
+                    tags=("overlay", "column"),
+                )
+    
+            qlist = questions_for_page(state["page_index"])
+            for idx, region in enumerate(qlist, start=1):
+                rect = region.normalized_rect()
+                x0, y0 = pdf_to_canvas_coords(rect[0], rect[1])
+                x1, y1 = pdf_to_canvas_coords(rect[2], rect[3])
+                width = 3 if region.id == state.get("selected_qid") else 2
+                color = "#5cb85c" if region.id == state.get("selected_qid") else "#3fa34d"
+                canvas.create_rectangle(
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    outline=color,
+                    width=width,
+                    tags=("overlay", "question"),
+                )
+                canvas.create_text(
+                    x0 + 6,
+                    y0 + 12,
+                    text=str(idx),
+                    fill="white",
+                    font=("Helvetica", 10, "bold"),
+                    anchor="nw",
+                    tags=("overlay", "label"),
+                )
+    
+                opt_rect = region.normalized_options_rect()
+                if opt_rect:
+                    ox0, oy0 = pdf_to_canvas_coords(opt_rect[0], opt_rect[1])
+                    ox1, oy1 = pdf_to_canvas_coords(opt_rect[2], opt_rect[3])
+                    canvas.create_rectangle(
+                        ox0,
+                        oy0,
+                        ox1,
+                        oy1,
+                        outline="#2fa8ff",
+                        width=2,
+                        dash=(6, 3),
+                        tags=("overlay", "options"),
+                    )
+    
+                for opt_idx, opt_box in region.iter_option_rects():
+                    bx0, by0 = pdf_to_canvas_coords(opt_box[0], opt_box[1])
+                    bx1, by1 = pdf_to_canvas_coords(opt_box[2], opt_box[3])
+                    canvas.create_rectangle(
+                        bx0,
+                        by0,
+                        bx1,
+                        by1,
+                        outline="#ff6f61",
+                        width=2,
+                        tags=("overlay", "opt"),
+                    )
+                    canvas.create_text(
+                        bx0 + 6,
+                        by0 + 12,
+                        text=str(opt_idx),
+                        fill="#ff6f61",
+                        font=("Helvetica", 9, "bold"),
+                        anchor="nw",
+                        tags=("overlay", "optlabel"),
+                    )
+    
+        def refresh_image(*_):
+            base_img = state.get("base_img")
+            if base_img is None:
+                return
+            zoom = max(0.1, zoom_var.get() / 100.0)
+            state["zoom"] = zoom
+            base_w = state.get("base_w") or base_img.width
+            base_h = state.get("base_h") or base_img.height
+            disp_w = max(1, int(round(base_w * zoom)))
+            disp_h = max(1, int(round(base_h * zoom)))
+            resized = base_img.resize((disp_w, disp_h), Image.LANCZOS)
+            photo = ImageTk.PhotoImage(resized)
+            photo_cache["image"] = photo
+            if "image_id" not in photo_cache:
+                photo_cache["image_id"] = canvas.create_image(0, 0, image=photo, anchor="nw")
+            else:
+                canvas.itemconfigure(photo_cache["image_id"], image=photo)
+            canvas.configure(scrollregion=(0, 0, disp_w, disp_h))
+            zoom_display_var.set(f"{zoom * 100:.0f}%")
+            draw_overlays()
+    
+        def select_question(region: Optional[ManualQuestionRegion]):
+            state["selected_qid"] = region.id if region else None
+            update_selection_label()
+            draw_overlays()
+    
+        def hit_test_question(pdf_point: Tuple[float, float]) -> Optional[ManualQuestionRegion]:
+            qlist = questions_for_page(state["page_index"])
+            for region in reversed(qlist):
+                if _point_in_rect(pdf_point, region.rect):
+                    return region
+            return None
+    
+        def clear_option_mode():
+            state["active_option_digit"] = None
+            update_mode_label()
+    
+        def on_button_press(event):
+            canvas.focus_set()
+            start = (canvas.canvasx(event.x), canvas.canvasy(event.y))
+            state["drag_start"] = start
+            mode = "question"
+            value = None
+            if state.get("active_option_digit"):
+                mode = "option"
+                value = state["active_option_digit"]
+            elif state.get("shift_active"):
+                mode = "options_block"
+            state["draw_mode"] = (mode, value)
+            outline = "#3fa34d"
+            if mode == "options_block":
+                outline = "#2fa8ff"
+            elif mode == "option":
+                outline = "#ff6f61"
+            rect_id = canvas.create_rectangle(
+                start[0],
+                start[1],
+                start[0],
+                start[1],
+                outline=outline,
+                width=2,
+                dash=(4, 4),
+                tags=("overlay", "preview"),
+            )
+            state["drag_rect_id"] = rect_id
+            update_mode_label()
+    
+        def on_drag(event):
+            rect_id = state.get("drag_rect_id")
+            start = state.get("drag_start")
+            if rect_id is None or start is None:
+                return
+            cur = (canvas.canvasx(event.x), canvas.canvasy(event.y))
+            canvas.coords(rect_id, start[0], start[1], cur[0], cur[1])
+    
+        def remove_preview_rect():
+            rect_id = state.get("drag_rect_id")
+            if rect_id is not None:
+                canvas.delete(rect_id)
+            state["drag_rect_id"] = None
+    
+        def on_button_release(event):
+            start = state.get("drag_start")
+            if start is None:
+                remove_preview_rect()
+                return
+            end = (canvas.canvasx(event.x), canvas.canvasy(event.y))
+            remove_preview_rect()
+            state["drag_start"] = None
+    
+            dx = abs(end[0] - start[0])
+            dy = abs(end[1] - start[1])
+            if dx < 4 and dy < 4:
+                pdf_point = canvas_to_pdf_coords(end[0], end[1])
+                hit = hit_test_question(pdf_point)
+                if hit:
+                    select_question(hit)
+                    set_status(
+                        f"Selected question ID {hit.id} on page {state['page_index'] + 1}."
+                    )
+                else:
+                    set_status("No question under cursor; drag to create one.")
+                return
+    
+            start_pdf = canvas_to_pdf_coords(start[0], start[1])
+            end_pdf = canvas_to_pdf_coords(end[0], end[1])
+            rect = _normalize_rect((start_pdf[0], start_pdf[1], end_pdf[0], end_pdf[1]))
+            page_index = state["page_index"]
+            mode, value = state.get("draw_mode", ("question", None))
+    
+            if mode == "question":
+                qid = state["next_qid"]
+                state["next_qid"] += 1
+                region = ManualQuestionRegion(id=qid, page_index=page_index, rect=rect)
+                questions_for_page(page_index).append(region)
+                select_question(region)
+                set_status(
+                    f"Added question #{len(questions_for_page(page_index))} on page {page_index + 1}."
+                )
+            elif mode == "options_block":
+                target = get_selected_question()
+                if target is None:
+                    set_status("Select a question before marking option blocks.")
+                else:
+                    target.options_rect = rect
+                    set_status(
+                        f"Set options block for question ID {target.id} on page {page_index + 1}."
+                    )
+            elif mode == "option" and value is not None:
+                target = get_selected_question()
+                if target is None:
+                    set_status("Select a question before assigning option areas.")
+                else:
+                    try:
+                        opt_idx = int(value)
+                    except Exception:
+                        opt_idx = None
+                    if opt_idx is None:
+                        set_status("Invalid option index.")
+                    else:
+                        target.option_rects[opt_idx] = rect
+                        set_status(
+                            f"Assigned option {opt_idx} for question ID {target.id}."
+                        )
+                clear_option_mode()
+            else:
+                set_status("Unknown drawing mode; nothing recorded.")
+    
+            draw_overlays()
+    
+        def delete_selected():
+            q = get_selected_question()
+            if q is None:
+                set_status("No question selected to delete.")
+                return
+            qlist = questions_for_page(state["page_index"])
+            try:
+                qlist.remove(q)
+            except ValueError:
+                pass
+            state["selected_qid"] = None
+            update_selection_label()
+            draw_overlays()
+            set_status("Deleted selected question region.")
+    
+        def clear_selected_options():
+            q = get_selected_question()
+            if q is None:
+                set_status("No question selected to clear options.")
+                return
+            q.options_rect = None
+            q.option_rects.clear()
+            draw_overlays()
+            set_status("Cleared option regions for selected question.")
+    
+        def on_key_press(event):
+            if event.keysym in ("Shift_L", "Shift_R"):
+                state["shift_active"] = True
+                update_mode_label()
+                return
+            if event.char and event.char.isdigit() and event.char != "0":
+                state["active_option_digit"] = int(event.char)
+                update_mode_label()
+                set_status(f"Assigning option {event.char}; drag to mark its area.")
+                return
+            if event.keysym in ("Escape", "Return"):
+                clear_option_mode()
+                set_status("Exited option assignment mode.")
+                return
+            if event.keysym in ("Delete", "BackSpace"):
+                delete_selected()
+                return
+            if event.keysym.lower() == "c" and (event.state & 0x4):  # Ctrl+C to clear options
+                clear_selected_options()
+    
+        def on_key_release(event):
+            if event.keysym in ("Shift_L", "Shift_R"):
+                state["shift_active"] = False
+                update_mode_label()
+    
+        def change_page(delta: int):
+            new_index = state["page_index"] + delta
+            if not (0 <= new_index < page_count):
+                return
+            load_page(new_index)
+    
+        def load_page(idx: int):
+            if not (0 <= idx < page_count):
+                return
+            page = pdf.pages[idx]
+            base_img = page.to_image(resolution=int(render_dpi)).original.convert("RGB")
+            base_w, base_h = base_img.size
+            pdf_w, pdf_h = float(page.width), float(page.height)
+            state["base_img"] = base_img
+            state["base_w"] = base_w
+            state["base_h"] = base_h
+            state["scale_x"] = base_w / pdf_w if pdf_w else 1.0
+            state["scale_y"] = base_h / pdf_h if pdf_h else 1.0
+            state["page_index"] = idx
+            state["L_bbox"], state["R_bbox"] = two_col_bboxes(
+                page, top_frac, bottom_frac, gutter_frac
+            )
+            if state.get("selected_qid") not in [q.id for q in questions_for_page(idx)]:
+                state["selected_qid"] = None
+            page_info_var.set(f"Page {idx + 1} / {page_count}")
+            update_selection_label()
+            refresh_image()
+            set_status("Drag to mark question areas. Use number keys for options.")
+    
+        def confirm():
+            collected: List[ManualQuestionRegion] = []
+            for page_idx, qlist in state.get("questions", {}).items():
+                ordered = sorted(
+                    qlist,
+                    key=lambda region: (
+                        region.normalized_rect()[1],
+                        region.normalized_rect()[0],
+                        region.id,
+                    ),
+                )
+                collected.extend(ordered)
+            if not collected:
+                if not messagebox.askyesno(
+                        "No selections", "No question regions were selected. Continue?"
+                ):
+                    return
+            state["result"] = collected
+            root.destroy()
+    
+        def cancel():
+            state["result"] = None
+            root.destroy()
+    
+        ttk.Label(controls, text="Zoom:").grid(row=0, column=0, sticky="w")
+        ttk.Scale(
+            controls,
+            from_=40,
+            to=300,
+            orient="horizontal",
+            variable=zoom_var,
+            command=lambda _evt: refresh_image(),
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 8))
+        ttk.Label(controls, textvariable=zoom_display_var, width=6).grid(
+            row=0, column=2, sticky="w"
+        )
+        ttk.Separator(controls, orient="vertical").grid(row=0, column=3, sticky="ns", padx=6)
+        ttk.Label(controls, text="Mode:").grid(row=0, column=4, sticky="w")
+        ttk.Label(controls, textvariable=mode_var, width=14).grid(row=0, column=5, sticky="w")
+        ttk.Label(controls, text="Selected:").grid(row=0, column=6, sticky="e")
+        ttk.Label(controls, textvariable=selection_var, width=18).grid(
+            row=0, column=7, sticky="w", padx=(4, 0)
+        )
+        ttk.Button(controls, text="Delete", command=delete_selected).grid(
+            row=0, column=8, padx=(8, 4)
+        )
+        ttk.Button(controls, text="Clear options", command=clear_selected_options).grid(
+            row=0, column=9, padx=(4, 4)
+        )
+        ttk.Button(controls, text="Cancel", command=cancel).grid(row=0, column=10, padx=(12, 4))
+        ttk.Button(controls, text="Apply", command=confirm).grid(row=0, column=11)
+    
+        ttk.Separator(controls, orient="horizontal").grid(
+            row=1, column=0, columnspan=12, sticky="ew", pady=(6, 6)
+        )
+        ttk.Label(controls, textvariable=page_info_var).grid(row=2, column=0, columnspan=3, sticky="w")
+        ttk.Button(controls, text="◀ Prev", command=lambda: change_page(-1)).grid(
+            row=2, column=3, padx=(4, 4)
+        )
+        ttk.Button(controls, text="Next ▶", command=lambda: change_page(1)).grid(
+            row=2, column=4, padx=(4, 8)
+        )
+        ttk.Label(
+            controls,
+            text="Tips: Left drag = question, Shift+drag = option block, number key + drag = option.",
+        ).grid(row=2, column=5, columnspan=7, sticky="w", padx=(8, 0))
+    
+        status_label = ttk.Label(main_frame, textvariable=status_var, anchor="w")
+        status_label.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+    
+        canvas.bind("<ButtonPress-1>", on_button_press)
+        canvas.bind("<B1-Motion>", on_drag)
+        canvas.bind("<ButtonRelease-1>", on_button_release)
+        canvas.bind("<KeyPress>", on_key_press)
+        canvas.bind("<KeyRelease>", on_key_release)
+        canvas.focus_set()
+        root.bind("<KeyPress>", on_key_press)
+        root.bind("<KeyRelease>", on_key_release)
+        root.protocol("WM_DELETE_WINDOW", cancel)
+
+        load_page(0)
+        root.mainloop()
+
+        result = state.get("result")
+        if result is not None:
+            logger.info(
+                "Interactive chunk selector captured %d question regions.",
+                len(result),
+            )
+        return result
+    finally:
+        pdf.close()
 
 
 def interactive_margin_selection(
@@ -2139,6 +2995,8 @@ def process_single_pdf(
     margin_ui: bool = False,
     margin_ui_page: int = 1,
     margin_ui_dpi: int = 200,
+    chunk_ui: bool = False,
+    chunk_ui_dpi: int = 200,
     heartbeat_interval: float = 30.0,
     chunk_debug_dir: Optional[str] = None,
     failed_chunk_log_chars: int = 240,
@@ -2197,6 +3055,33 @@ def process_single_pdf(
         "auto" if margin_right is None else f"{margin_right:.2f}",
     )
 
+    manual_regions: Optional[List[ManualQuestionRegion]] = None
+    if chunk_ui:
+        try:
+            manual_regions = interactive_chunk_selection(
+                pdf_path=pdf_path,
+                top_frac=top_frac,
+                bottom_frac=bottom_frac,
+                gutter_frac=gutter_frac,
+                render_dpi=chunk_ui_dpi,
+            )
+        except RuntimeError as exc:
+            logger.exception("Chunk selector failed: %s", exc)
+            sys.exit(4)
+        if manual_regions is None:
+            logger.info(
+                "Manual chunk selection cancelled; continuing with automatic detection."
+            )
+        elif not manual_regions:
+            logger.warning(
+                "Manual chunk selector returned zero regions; no questions will be extracted unless regions are added."
+            )
+        else:
+            logger.info(
+                "Manual chunk override enabled with %d regions.",
+                len(manual_regions),
+            )
+
     heartbeat = HeartbeatLogger(
         interval=heartbeat_interval,
         message=f"Still processing {os.path.basename(pdf_path)}...",
@@ -2223,6 +3108,7 @@ def process_single_pdf(
             ocr_settings=ocr_settings,
             chunk_debug_dir=chunk_debug_dir,
             failed_chunk_log_chars=failed_chunk_log_chars,
+            manual_questions=manual_regions if manual_regions is not None else None,
         )
     finally:
         heartbeat.stop()
@@ -2454,6 +3340,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=200,
         help="Rendering DPI for the margin preview window",
+    )
+
+    ap.add_argument(
+        "--chunk-ui",
+        action="store_true",
+        help=(
+            "Launch an interactive tool to draw question/option regions that override automatic chunking"
+        ),
+    )
+    ap.add_argument(
+        "--chunk-ui-dpi",
+        type=int,
+        default=200,
+        help="Rendering DPI for the manual chunk selection window",
     )
 
     ap.add_argument(
@@ -2713,6 +3613,8 @@ def main():
                 margin_ui=args.margin_ui,
                 margin_ui_page=args.margin_ui_page,
                 margin_ui_dpi=args.margin_ui_dpi,
+                chunk_ui=args.chunk_ui,
+                chunk_ui_dpi=args.chunk_ui_dpi,
                 heartbeat_interval=args.heartbeat_secs,
                 chunk_debug_dir=debug_dir,
                 failed_chunk_log_chars=args.failed_chunk_log_chars,
