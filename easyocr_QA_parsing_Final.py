@@ -2075,6 +2075,15 @@ def pdf_to_qa_flow_chunks(
             if chunk_lines:
                 chunk_lines.sort(key=lambda ln: (ln.get("top", 0.0), ln.get("x0", 0.0)))
 
+            manual_info = ch.get("manual") if isinstance(ch, dict) else None
+            manual_qno: Optional[int] = None
+            if isinstance(manual_info, dict):
+                raw_manual_q = manual_info.get("question_id")
+                try:
+                    manual_qno = int(raw_manual_q) if raw_manual_q is not None else None
+                except Exception:
+                    manual_qno = None
+
             stem, options, dispute, dispute_site, detected_qnum = (
                 extract_qa_from_chunk_text(text, chunk_lines, ch.get("manual"))
             )
@@ -2090,7 +2099,18 @@ def pdf_to_qa_flow_chunks(
                 )
                 continue
 
-            if detected_qnum is not None:
+            if manual_qno is not None:
+                if (
+                    detected_qnum is not None
+                    and detected_qnum != manual_qno
+                ):
+                    logger.debug(
+                        "Manual question %s differs from detected %s; using manual label.",
+                        manual_qno,
+                        detected_qnum,
+                    )
+                qno = manual_qno
+            elif detected_qnum is not None:
                 qno = detected_qnum
             elif expected_next is not None:
                 qno = expected_next
