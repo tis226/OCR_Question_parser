@@ -2129,6 +2129,10 @@ def interactive_chunk_selection(
             "questions": {},
             "selected_qid": None,
             "next_qid": 1,
+            "expected_total": None,
+            "available_qnums": [],
+            "used_qnums": set(),
+            "current_qnum": None,
             "drag_start": None,
             "drag_rect_id": None,
             "draw_mode": ("question", None),
@@ -2157,7 +2161,9 @@ def interactive_chunk_selection(
     
         controls = ttk.Frame(main_frame)
         controls.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        controls.columnconfigure(3, weight=1)
         controls.columnconfigure(7, weight=1)
+        controls.columnconfigure(8, weight=1)
     
         status_var = tk.StringVar(value="Drag to mark questions. Hold Shift for option blocks.")
         selection_var = tk.StringVar(value="None")
@@ -2165,9 +2171,192 @@ def interactive_chunk_selection(
         page_info_var = tk.StringVar(value="Page 1 / %d" % page_count)
         zoom_var = tk.DoubleVar(value=100.0)
         zoom_display_var = tk.StringVar(value="100%")
-    
+        progress_var = tk.StringVar(value="Assigned 0 question(s)")
+        total_questions_var = tk.StringVar()
+        next_question_var = tk.StringVar()
+
         photo_cache: Dict[str, Any] = {}
-    
+
+        def gather_all_questions() -> List[ManualQuestionRegion]:
+            items: List[ManualQuestionRegion] = []
+            for qlist in state.get("questions", {}).values():
+                items.extend(qlist)
+            return items
+
+        def recompute_used_numbers():
+            used = {region.id for region in gather_all_questions()}
+            state["used_qnums"] = used
+            max_id = max(used) if used else 0
+            state["next_qid"] = max(max_id + 1, state.get("next_qid", 1))
+
+        def sync_current_entry():
+            current = state.get("current_qnum")
+            if current is None:
+                next_question_var.set("")
+            else:
+                next_question_var.set(str(current))
+
+        def recalc_number_state():
+            expected = state.get("expected_total")
+            used_set = state.get("used_qnums", set())
+            if expected:
+                available = [n for n in range(1, expected + 1) if n not in used_set]
+                state["available_qnums"] = available
+                current = state.get("current_qnum")
+                if current is None or current not in available:
+                    state["current_qnum"] = available[0] if available else None
+                current = state.get("current_qnum")
+                progress_var.set(
+                    "Assigned %d/%d • Next: %s"
+                    % (len(used_set), expected, str(current) if current is not None else "-")
+                )
+            else:
+                state["available_qnums"] = []
+                current = state.get("current_qnum")
+                if current is None or current in used_set:
+                    state["current_qnum"] = state.get("next_qid", 1)
+                current = state.get("current_qnum")
+                if current is None:
+                    progress_var.set("Assigned %d question(s)" % len(used_set))
+                else:
+                    progress_var.set(
+                        "Assigned %d question(s) • Next: %s"
+                        % (len(used_set), current)
+                    )
+            sync_current_entry()
+
+        def pick_question_number() -> int:
+            used_set = state.get("used_qnums", set())
+            current = state.get("current_qnum")
+            if current is not None and current not in used_set:
+                return current
+            expected = state.get("expected_total")
+            if expected:
+                available = [n for n in range(1, expected + 1) if n not in used_set]
+                if available:
+                    state["available_qnums"] = available
+                    state["current_qnum"] = available[0]
+                    sync_current_entry()
+                    return available[0]
+            hint = state.get("current_qnum")
+            if hint is not None and hint not in used_set:
+                return hint
+            return state.get("next_qid", 1)
+
+        def apply_total_count():
+            raw = total_questions_var.get().strip()
+            if not raw:
+                state["expected_total"] = None
+                recompute_used_numbers()
+                recalc_number_state()
+                set_status("Cleared expected question count; free-form numbering enabled.")
+                return
+            try:
+                total = int(raw)
+            except ValueError:
+                messagebox.showerror("Invalid input", "Total questions must be an integer.")
+                return
+            if total <= 0:
+                messagebox.showerror(
+                    "Invalid count", "Total questions must be a positive integer."
+                )
+                return
+            current_questions = gather_all_questions()
+            if len(current_questions) > total:
+                if not messagebox.askyesno(
+                    "Reduce total?",
+                    (
+                        "You already have %d questions marked. Setting the total to %d "
+                        "will leave some numbers unused. Continue?"
+                    )
+                    % (len(current_questions), total),
+                ):
+                    return
+            state["expected_total"] = total
+            recompute_used_numbers()
+            recalc_number_state()
+            set_status(f"Expecting {total} total questions; numbering updated.")
+
+        def set_next_question_number():
+            raw = next_question_var.get().strip()
+            if not raw:
+                state["current_qnum"] = None
+                recalc_number_state()
+                set_status("Cleared manual next question number.")
+                return
+            try:
+                value = int(raw)
+            except ValueError:
+                messagebox.showerror("Invalid input", "Next question number must be an integer.")
+                return
+            if value <= 0:
+                messagebox.showerror(
+                    "Invalid number", "Question numbers must be positive integers."
+                )
+                return
+            expected = state.get("expected_total")
+            if expected and not (1 <= value <= expected):
+                messagebox.showerror(
+                    "Out of range",
+                    f"Question number must be between 1 and {expected}.",
+                )
+                return
+            used_set = state.get("used_qnums", set())
+            if value in used_set:
+                messagebox.showerror(
+                    "Already used",
+                    f"Question number {value} is already assigned. Choose another.",
+                )
+                return
+            state["current_qnum"] = value
+            recalc_number_state()
+            set_status(f"Next question will use number {value}.")
+
+        def assign_selected_question_number():
+            q = get_selected_question()
+            if q is None:
+                messagebox.showwarning(
+                    "No selection", "Select a question region before assigning a number."
+                )
+                return
+            raw = next_question_var.get().strip()
+            if not raw:
+                messagebox.showerror(
+                    "Missing number", "Enter a question number to assign to the selection."
+                )
+                return
+            try:
+                value = int(raw)
+            except ValueError:
+                messagebox.showerror("Invalid input", "Question number must be an integer.")
+                return
+            if value <= 0:
+                messagebox.showerror(
+                    "Invalid number", "Question numbers must be positive integers."
+                )
+                return
+            expected = state.get("expected_total")
+            if expected and not (1 <= value <= expected):
+                messagebox.showerror(
+                    "Out of range",
+                    f"Question number must be between 1 and {expected}.",
+                )
+                return
+            used_set = state.get("used_qnums", set())
+            if value in used_set and value != q.id:
+                messagebox.showerror(
+                    "Already used",
+                    f"Question number {value} is already assigned to another region.",
+                )
+                return
+            q.id = value
+            state["selected_qid"] = value
+            recompute_used_numbers()
+            recalc_number_state()
+            draw_overlays()
+            update_selection_label()
+            set_status(f"Assigned question #{value} to the selected region.")
+
         def pdf_to_canvas_coords(x: float, y: float) -> Tuple[float, float]:
             zoom = state.get("zoom", 1.0)
             return (
@@ -2199,7 +2388,7 @@ def interactive_chunk_selection(
             if sel is None:
                 selection_var.set("None")
             else:
-                selection_var.set(f"Page {sel.page_index + 1} / ID {sel.id}")
+                selection_var.set(f"Page {sel.page_index + 1} / Question {sel.id}")
     
         def update_mode_label():
             mode, value = state.get("draw_mode", ("question", None))
@@ -2248,7 +2437,7 @@ def interactive_chunk_selection(
                 )
     
             qlist = questions_for_page(state["page_index"])
-            for idx, region in enumerate(qlist, start=1):
+            for region in qlist:
                 rect = region.normalized_rect()
                 x0, y0 = pdf_to_canvas_coords(rect[0], rect[1])
                 x1, y1 = pdf_to_canvas_coords(rect[2], rect[3])
@@ -2266,7 +2455,7 @@ def interactive_chunk_selection(
                 canvas.create_text(
                     x0 + 6,
                     y0 + 12,
-                    text=str(idx),
+                    text=str(region.id),
                     fill="white",
                     font=("Helvetica", 10, "bold"),
                     anchor="nw",
@@ -2384,7 +2573,23 @@ def interactive_chunk_selection(
                 return
             cur = (canvas.canvasx(event.x), canvas.canvasy(event.y))
             canvas.coords(rect_id, start[0], start[1], cur[0], cur[1])
-    
+
+        def on_mousewheel(event):
+            if hasattr(event, "delta") and event.delta:
+                steps = max(1, abs(int(event.delta / 120)) if event.delta else 1)
+                direction = -1 if event.delta > 0 else 1
+                if event.state & 0x1:  # Shift for horizontal scroll
+                    canvas.xview_scroll(direction * steps, "units")
+                else:
+                    canvas.yview_scroll(direction * steps, "units")
+            elif getattr(event, "num", None) in (4, 5):
+                direction = -1 if event.num == 4 else 1
+                if event.state & 0x1:
+                    canvas.xview_scroll(direction, "units")
+                else:
+                    canvas.yview_scroll(direction, "units")
+            return "break"
+
         def remove_preview_rect():
             rect_id = state.get("drag_rect_id")
             if rect_id is not None:
@@ -2408,7 +2613,7 @@ def interactive_chunk_selection(
                 if hit:
                     select_question(hit)
                     set_status(
-                        f"Selected question ID {hit.id} on page {state['page_index'] + 1}."
+                        f"Selected question #{hit.id} on page {state['page_index'] + 1}."
                     )
                 else:
                     set_status("No question under cursor; drag to create one.")
@@ -2421,14 +2626,19 @@ def interactive_chunk_selection(
             mode, value = state.get("draw_mode", ("question", None))
     
             if mode == "question":
-                qid = state["next_qid"]
-                state["next_qid"] += 1
+                qid = pick_question_number()
                 region = ManualQuestionRegion(id=qid, page_index=page_index, rect=rect)
                 questions_for_page(page_index).append(region)
+                recompute_used_numbers()
+                recalc_number_state()
                 select_question(region)
-                set_status(
-                    f"Added question #{len(questions_for_page(page_index))} on page {page_index + 1}."
-                )
+                expected_total = state.get("expected_total")
+                if expected_total and qid > expected_total:
+                    set_status(
+                        f"Added question #{qid} on page {page_index + 1} (beyond expected total)."
+                    )
+                else:
+                    set_status(f"Added question #{qid} on page {page_index + 1}.")
             elif mode == "options_block":
                 target = get_selected_question()
                 if target is None:
@@ -2471,6 +2681,8 @@ def interactive_chunk_selection(
             except ValueError:
                 pass
             state["selected_qid"] = None
+            recompute_used_numbers()
+            recalc_number_state()
             update_selection_label()
             draw_overlays()
             set_status("Deleted selected question region.")
@@ -2605,6 +2817,29 @@ def interactive_chunk_selection(
             controls,
             text="Tips: Left drag = question, Shift+drag = option block, number key + drag = option.",
         ).grid(row=2, column=5, columnspan=7, sticky="w", padx=(8, 0))
+
+        ttk.Label(controls, text="Total questions:").grid(row=3, column=0, sticky="w")
+        total_entry = ttk.Entry(controls, textvariable=total_questions_var, width=6)
+        total_entry.grid(row=3, column=1, sticky="w")
+        ttk.Button(controls, text="Apply total", command=apply_total_count).grid(
+            row=3, column=2, padx=(4, 8), sticky="w"
+        )
+        total_entry.bind("<Return>", lambda _evt: apply_total_count())
+        ttk.Label(controls, textvariable=progress_var).grid(
+            row=3, column=3, columnspan=2, sticky="w"
+        )
+        ttk.Label(controls, text="Next number:").grid(row=3, column=5, sticky="e")
+        next_entry = ttk.Entry(controls, textvariable=next_question_var, width=6)
+        next_entry.grid(row=3, column=6, sticky="w")
+        ttk.Button(controls, text="Set next", command=set_next_question_number).grid(
+            row=3, column=7, padx=(4, 4), sticky="w"
+        )
+        next_entry.bind("<Return>", lambda _evt: set_next_question_number())
+        ttk.Button(
+            controls,
+            text="Assign selected",
+            command=assign_selected_question_number,
+        ).grid(row=3, column=8, padx=(4, 0), sticky="w")
     
         status_label = ttk.Label(main_frame, textvariable=status_var, anchor="w")
         status_label.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
@@ -2614,11 +2849,18 @@ def interactive_chunk_selection(
         canvas.bind("<ButtonRelease-1>", on_button_release)
         canvas.bind("<KeyPress>", on_key_press)
         canvas.bind("<KeyRelease>", on_key_release)
+        canvas.bind("<MouseWheel>", on_mousewheel)
+        canvas.bind("<Shift-MouseWheel>", on_mousewheel)
+        canvas.bind("<Button-4>", on_mousewheel)
+        canvas.bind("<Button-5>", on_mousewheel)
+        canvas.bind("<Enter>", lambda _evt: canvas.focus_set())
         canvas.focus_set()
         root.bind("<KeyPress>", on_key_press)
         root.bind("<KeyRelease>", on_key_release)
         root.protocol("WM_DELETE_WINDOW", cancel)
 
+        recompute_used_numbers()
+        recalc_number_state()
         load_page(0)
         root.mainloop()
 
