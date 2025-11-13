@@ -30,6 +30,11 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
+# Default column window fractions (relative to page width/height)
+DEFAULT_TOP_FRAC = 0.10
+DEFAULT_BOTTOM_FRAC = 0.90
+DEFAULT_GUTTER_FRAC = 0.005
+
 # =========================
 # Helpers
 # =========================
@@ -323,7 +328,12 @@ class EasyOCRTextExtractor:
 # Layout helpers
 # =========================
 
-def two_col_bboxes(page, top_frac=0.04, bottom_frac=0.96, gutter_frac=0.005):
+def two_col_bboxes(
+    page,
+    top_frac: float = DEFAULT_TOP_FRAC,
+    bottom_frac: float = DEFAULT_BOTTOM_FRAC,
+    gutter_frac: float = DEFAULT_GUTTER_FRAC,
+):
     w, h = float(page.width), float(page.height)
     top = h * top_frac
     bottom = h * bottom_frac
@@ -657,9 +667,9 @@ def pdf_to_qa_flow_chunks(
     L_rel: Optional[float],
     R_rel: Optional[float],
     tol: float,
-    top_frac: float = 0.04,
-    bottom_frac: float = 0.96,
-    gutter_frac: float = 0.005,
+    top_frac: float = DEFAULT_TOP_FRAC,
+    bottom_frac: float = DEFAULT_BOTTOM_FRAC,
+    gutter_frac: float = DEFAULT_GUTTER_FRAC,
     y_tol: float = 3.0,
     clip_mode: str = "none",
     chunk_preview_dir: Optional[str] = None,
@@ -1272,9 +1282,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--start-num", type=int, default=1, help="Starting question number")
 
     ap.add_argument("--tol", type=float, default=1.0, help="Margin match tolerance (pt)")
-    ap.add_argument("--top-frac", type=float, default=0.04)
-    ap.add_argument("--bottom-frac", type=float, default=0.96)
-    ap.add_argument("--gutter-frac", type=float, default=0.005)
+    ap.add_argument(
+        "--top-frac",
+        type=float,
+        default=DEFAULT_TOP_FRAC,
+        help="Top fraction for the column window (default: 0.10)",
+    )
+    ap.add_argument(
+        "--bottom-frac",
+        type=float,
+        default=DEFAULT_BOTTOM_FRAC,
+        help="Bottom fraction for the column window (default: 0.90)",
+    )
+    ap.add_argument(
+        "--gutter-frac",
+        type=float,
+        default=DEFAULT_GUTTER_FRAC,
+        help="Half-width of the gutter between columns as a fraction of page width",
+    )
 
     ap.add_argument(
         "--clip-mode",
