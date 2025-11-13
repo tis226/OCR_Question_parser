@@ -587,51 +587,103 @@ def parse_dispute(stem: str, keep_text: bool = True):
     return True, (site or None), new_stem
 
 
-def sanitize_chunk_text(text: str, expected_next: Optional[int]) -> str:
+def extract_leading_qnum_and_clean(stem: str) -> Tuple[Optional[int], str]:
+    if not stem:
+        return None, stem
+    m = QUESTION_NUM_RE.match(stem)
+    if not m:
+        return None, stem
+    digits = next((g for g in m.groups() if g), None)
+    try:
+        qnum = int(digits) if digits is not None else None
+    except Exception:
+        qnum = None
+    return qnum, stem[m.end() :].lstrip()
+
+
+def _trim_to_first_question(text: str) -> Tuple[str, Optional[int]]:
+    if not text:
+        return text, None
+    m = QUESTION_START_LINE_RE.search(text)
+    if not m:
+        return text, None
+    trimmed = text[m.start() :]
+    digits = None
+    dm = QUESTION_NUM_RE.match(trimmed)
+    if dm:
+        raw = next((g for g in dm.groups() if g), None)
+        try:
+            digits = int(raw) if raw is not None else None
+        except Exception:
+            digits = None
+    return trimmed, digits
+
+
+def sanitize_chunk_text(text: str, expected_next_qnum: Optional[int]) -> str:
+    if not text:
+        return text
+
     text = _normalize_visible_text(text)
-    text = _strip_header_garbage(text)
-    if expected_next is not None:
-        text = re.sub(
-            rf"^\s*(?:문제\s*)?{expected_next}\s*[.)]?\s*",
-            "",
-            text.strip(),
-            flags=re.MULTILINE,
-        )
+    trimmed, current_qnum = _trim_to_first_question(text)
+    text = trimmed
+
+    if current_qnum is not None:
+        target_next = current_qnum + 1
+    else:
+        target_next = expected_next_qnum
+
+    if target_next is None:
+        return text
+
+    for match in QUESTION_START_LINE_RE.finditer(text):
+        if match.start() == 0:
+            continue
+        candidate_slice = text[match.start() :]
+        dm = QUESTION_NUM_RE.match(candidate_slice)
+        if not dm:
+            continue
+        raw = next((g for g in dm.groups() if g), None)
+        if raw is None:
+            continue
+        try:
+            num = int(raw)
+        except Exception:
+            continue
+        if num >= 1000:
+            continue
+        if num == target_next:
+            return text[: match.start()].rstrip()
+
     return text
 
 
 def extract_qa_from_chunk_text(text: str):
-    text = norm_space(_normalize_option_markers(text))
-    m = QUESTION_START_LINE_RE.search(text)
-    if m:
-        text = text[m.start() :]
-    mnum = QUESTION_NUM_RE.match(text)
-    detected_qnum = None
-    if mnum:
-        detected_qnum = next((g for g in mnum.groups() if g), None)
-        if detected_qnum is not None:
-            detected_qnum = int(detected_qnum)
-        text = text[mnum.end() :]
+    if not text:
+        return None, None, False, None, None
 
-    if "①" not in text and "②" not in text and "③" not in text and "④" not in text:
-        return None, None, False, None, detected_qnum
+    text = _normalize_option_markers(text)
+    text = _strip_header_garbage(text)
 
-    parts = re.split(r"\s*[①②③④⑤⑥⑦⑧⑨⑩]", text)
-    if len(parts) < 2:
-        return None, None, False, None, detected_qnum
+    first_match = re.search(rf"[{OPTION_CLASS}]", text)
+    if not first_match:
+        return None, None, False, None, None
 
-    stem = norm_space(parts[0])
-    opts_blob = text[len(parts[0]) :]
-    dispute, dispute_site, stem = parse_dispute(stem)
+    first = first_match.start()
+    stem, opts_blob = text[:first], text[first:]
+
+    dispute, dispute_site, stem = parse_dispute(stem, keep_text=True)
     stem = norm_space(stem)
 
-    parts_split = [p for p in OPT_SPLIT_RE.split(opts_blob) if p]
+    detected_qnum, stem = extract_leading_qnum_and_clean(stem)
+    stem = norm_space(stem)
+
+    parts = [p for p in OPT_SPLIT_RE.split(opts_blob) if p]
     options = []
     i = 0
-    while i < len(parts_split):
-        sym = parts_split[i].strip()
+    while i < len(parts):
+        sym = parts[i].strip()
         if sym and sym[0] in OPTION_SET:
-            raw_txt = parts_split[i + 1] if (i + 1) < len(parts_split) else ""
+            raw_txt = parts[i + 1] if (i + 1) < len(parts) else ""
             clean_txt = norm_space(CIRCLED_STRIP_RE.sub("", raw_txt))
             options.append({"index": sym[0], "text": clean_txt})
             i += 2
