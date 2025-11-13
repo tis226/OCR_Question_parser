@@ -142,6 +142,12 @@ OPTION_SET.update(chr(cp) for cp in OPTION_EXTRA)
 OPTION_CLASS = "".join(sorted(OPTION_SET))
 QUESTION_CIRCLED_RANGE = f"{OPTION_CLASS}{chr(0x3250)}-{chr(0x32FF)}"
 
+ASCII_OPTION_RE = re.compile(r"(?<!\d)(?:\(|\[)?(1[0-9]|20|[1-9])\s*[).:]")
+DIGIT_TO_CIRCLED = {
+    str(i): chr(0x2460 + i - 1) if 1 <= i <= 20 else str(i)
+    for i in range(1, 21)
+}
+
 OPT_SPLIT_RE = re.compile(rf"(?=([{OPTION_CLASS}]))")
 CIRCLED_STRIP_RE = re.compile(rf"^[{OPTION_CLASS}]\s*")
 QUESTION_START_LINE_RE = re.compile(
@@ -164,6 +170,18 @@ LEADING_HEADER_STRIP = re.compile(
 
 def _strip_header_garbage(text: str) -> str:
     return norm_space(LEADING_HEADER_STRIP.sub("", text or ""))
+
+
+def _normalize_option_markers(text: str) -> str:
+    def repl(match: re.Match) -> str:
+        num = match.group(1)
+        circled = DIGIT_TO_CIRCLED.get(num)
+        if not circled or circled == num:
+            return match.group(0)
+        trailing = " " if not match.group(0).endswith(" ") else ""
+        return f"{circled}{trailing}"
+
+    return ASCII_OPTION_RE.sub(repl, text)
 
 
 def infer_year_from_filename(path: str) -> Optional[int]:
@@ -574,7 +592,7 @@ def sanitize_chunk_text(text: str, expected_next: Optional[int]) -> str:
 
 
 def extract_qa_from_chunk_text(text: str):
-    text = norm_space(text)
+    text = norm_space(_normalize_option_markers(text))
     m = QUESTION_START_LINE_RE.search(text)
     if m:
         text = text[m.start() :]
@@ -656,6 +674,50 @@ def save_chunk_preview(
     return os.path.abspath(out_path)
 
 
+def save_rasterized_pdf(pdf_path: str, out_path: str, dpi: int) -> None:
+    abs_out = os.path.abspath(os.path.expanduser(out_path))
+    ensure_dir(os.path.dirname(abs_out))
+    images: List[Image.Image] = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page_index, page in enumerate(pdf.pages, start=1):
+                logger.debug(
+                    "Rasterizing page %d/%d at %d DPI for PDF export",
+                    page_index,
+                    len(pdf.pages),
+                    dpi,
+                )
+                pil = page.to_image(resolution=int(dpi)).original.convert("RGB")
+                images.append(pil)
+    except Exception:
+        for img in images:
+            try:
+                img.close()
+            except Exception:
+                pass
+        raise
+
+    if not images:
+        logger.warning("No pages rendered for raster PDF export of %s", pdf_path)
+        return
+
+    first, rest = images[0], images[1:]
+    try:
+        first.save(
+            abs_out,
+            format="PDF",
+            save_all=True,
+            append_images=rest,
+            resolution=int(dpi),
+        )
+    finally:
+        for img in images:
+            try:
+                img.close()
+            except Exception:
+                pass
+
+
 # =========================
 # Top-level parse
 # =========================
@@ -676,6 +738,8 @@ def pdf_to_qa_flow_chunks(
     chunk_preview_dpi: int = 220,
     chunk_preview_pad: float = 2.0,
     ocr_settings: Optional[OCRSettings] = None,
+    chunk_debug_dir: Optional[str] = None,
+    failed_chunk_log_chars: int = 240,
 ):
     if ocr_settings is None:
         ocr_settings = OCRSettings()
@@ -688,6 +752,13 @@ def pdf_to_qa_flow_chunks(
         if chunk_preview_dir
         else None
     )
+    debug_dir = (
+        os.path.abspath(os.path.expanduser(chunk_debug_dir))
+        if chunk_debug_dir
+        else None
+    )
+    if debug_dir:
+        ensure_dir(debug_dir)
 
     with pdfplumber.open(pdf_path) as pdf:
         logger.info(
@@ -717,7 +788,7 @@ def pdf_to_qa_flow_chunks(
         )
         logger.info("Detected %d raw chunks before QA filtering", len(chunks))
 
-        for ch in chunks:
+        for idx, ch in enumerate(chunks, start=1):
             pieces = ch.get("pieces") or []
             if not pieces:
                 continue
@@ -726,16 +797,28 @@ def pdf_to_qa_flow_chunks(
             expected_next = (
                 last_assigned_qno + 1 if last_assigned_qno is not None else None
             )
-            text = "\n".join(p["text"] for p in pieces if p.get("text"))
-            text = sanitize_chunk_text(text, expected_next)
+            raw_text = "\n".join(p["text"] for p in pieces if p.get("text"))
+            text = sanitize_chunk_text(raw_text, expected_next)
+            debug_basename = f"p{p1:03d}_{pieces[0]['col']}_{idx:04d}"
+            if debug_dir:
+                raw_path = os.path.join(debug_dir, f"{debug_basename}_raw.txt")
+                clean_path = os.path.join(debug_dir, f"{debug_basename}_clean.txt")
+                with open(raw_path, "w", encoding="utf-8") as fh:
+                    fh.write(raw_text)
+                with open(clean_path, "w", encoding="utf-8") as fh:
+                    fh.write(text)
             stem, options, dispute, dispute_site, detected_qnum = (
                 extract_qa_from_chunk_text(text)
             )
             if stem is None or not options:
-                logger.debug(
-                    "Skipping chunk starting on page %d column %s: no QA detected",
+                snippet = text.strip().replace("\n", " ")
+                if len(snippet) > failed_chunk_log_chars:
+                    snippet = snippet[: failed_chunk_log_chars].rstrip() + "…"
+                logger.warning(
+                    "Skipping chunk starting on page %d column %s: no QA detected. Sample: %s",
                     pieces[0]["page"] + 1,
                     pieces[0]["col"],
+                    snippet or "<empty>",
                 )
                 continue
 
@@ -1186,6 +1269,10 @@ def process_single_pdf(
     margin_ui_page: int = 1,
     margin_ui_dpi: int = 200,
     heartbeat_interval: float = 30.0,
+    chunk_debug_dir: Optional[str] = None,
+    failed_chunk_log_chars: int = 240,
+    raster_pdf_path: Optional[str] = None,
+    raster_pdf_dpi: Optional[int] = None,
 ):
     if year is None:
         year = infer_year_from_filename(pdf_path) or datetime.now().year
@@ -1253,6 +1340,8 @@ def process_single_pdf(
             chunk_preview_dpi=preview_dpi,
             chunk_preview_pad=preview_pad,
             ocr_settings=ocr_settings,
+            chunk_debug_dir=chunk_debug_dir,
+            failed_chunk_log_chars=failed_chunk_log_chars,
         )
     finally:
         heartbeat.stop()
@@ -1262,6 +1351,11 @@ def process_single_pdf(
         json.dump(qa, f, ensure_ascii=False, indent=2)
 
     logger.info("Wrote %d QA items to %s", len(qa), out_path)
+
+    if raster_pdf_path:
+        dpi = raster_pdf_dpi or (ocr_settings.dpi if ocr_settings else 800)
+        save_rasterized_pdf(pdf_path, raster_pdf_path, dpi)
+        logger.info("Saved rasterized PDF preview to %s", raster_pdf_path)
     return qa
 
 
@@ -1313,6 +1407,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--chunk-preview-dir", help="Save JPEG previews of detected chunks")
     ap.add_argument("--chunk-preview-dpi", type=int, default=220)
     ap.add_argument("--chunk-preview-pad", type=float, default=2.0)
+    ap.add_argument(
+        "--chunk-debug-dir",
+        help="Directory to dump raw and sanitized chunk text for debugging",
+    )
+    ap.add_argument(
+        "--failed-chunk-log-chars",
+        type=int,
+        default=240,
+        help="Max characters of chunk text to include in skip warnings",
+    )
 
     ap.add_argument(
         "--easyocr-dpi", type=int, default=800, help="Rendering DPI for EasyOCR"
@@ -1326,6 +1430,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--easyocr-gpu",
         action="store_true",
         help="Enable GPU acceleration for EasyOCR if available",
+    )
+
+    ap.add_argument(
+        "--raster-pdf-out",
+        help="Path or directory to save a rasterized copy of each processed PDF",
+    )
+    ap.add_argument(
+        "--raster-pdf-dpi",
+        type=int,
+        help="DPI to use for raster PDF export (defaults to EasyOCR DPI)",
     )
 
     ap.add_argument(
@@ -1379,15 +1493,45 @@ def main():
         pdfs = [args.pdf]
         out_paths = [args.out]
         batch_mode = False
+        if args.raster_pdf_out:
+            base_pdf = os.path.splitext(os.path.basename(args.pdf))[0]
+            if os.path.isdir(args.raster_pdf_out) or args.raster_pdf_out.endswith(os.sep):
+                target_dir = args.raster_pdf_out
+                ensure_dir(target_dir)
+                raster_paths = [
+                    os.path.join(target_dir, f"{base_pdf}_raster.pdf")
+                ]
+            else:
+                ensure_dir(os.path.dirname(os.path.abspath(args.raster_pdf_out)))
+                raster_paths = [args.raster_pdf_out]
+        else:
+            raster_paths = [None]
     else:
         pdfs = list_pdfs(args.pdf_dir)
         if not pdfs:
             logger.error("No PDFs found in %s", args.pdf_dir)
             sys.exit(2)
         ensure_dir(args.out)
-        out_paths = [os.path.join(args.out, os.path.splitext(os.path.basename(p))[0] + ".json") for p in pdfs]
+        out_paths = [
+            os.path.join(
+                args.out,
+                os.path.splitext(os.path.basename(p))[0] + ".json",
+            )
+            for p in pdfs
+        ]
         batch_mode = True
         logger.info("Processing %d PDFs from %s", len(pdfs), args.pdf_dir)
+        if args.raster_pdf_out:
+            ensure_dir(args.raster_pdf_out)
+            raster_paths = [
+                os.path.join(
+                    args.raster_pdf_out,
+                    os.path.splitext(os.path.basename(p))[0] + "_raster.pdf",
+                )
+                for p in pdfs
+            ]
+        else:
+            raster_paths = [None] * len(pdfs)
 
     ocr_settings = OCRSettings(
         dpi=args.easyocr_dpi,
@@ -1395,8 +1539,24 @@ def main():
         gpu=args.easyocr_gpu,
     )
 
-    for pdf_path, out_path in zip(pdfs, out_paths):
+    for pdf_path, out_path, raster_path in zip(pdfs, out_paths, raster_paths):
         logger.info("Processing %s -> %s", os.path.basename(pdf_path), out_path)
+        if raster_path:
+            logger.info(
+                "Rasterized PDF output will be saved to %s",
+                raster_path,
+            )
+        debug_dir = None
+        if args.chunk_debug_dir:
+            base_debug = os.path.abspath(os.path.expanduser(args.chunk_debug_dir))
+            if batch_mode:
+                ensure_dir(base_debug)
+                debug_dir = os.path.join(
+                    base_debug, os.path.splitext(os.path.basename(pdf_path))[0]
+                )
+            else:
+                debug_dir = base_debug
+            ensure_dir(debug_dir)
         qa = process_single_pdf(
             pdf_path=pdf_path,
             out_path=out_path,
@@ -1417,6 +1577,10 @@ def main():
             margin_ui_page=args.margin_ui_page,
             margin_ui_dpi=args.margin_ui_dpi,
             heartbeat_interval=args.heartbeat_secs,
+            chunk_debug_dir=debug_dir,
+            failed_chunk_log_chars=args.failed_chunk_log_chars,
+            raster_pdf_path=raster_path,
+            raster_pdf_dpi=args.raster_pdf_dpi,
         )
         logger.info("Completed %s with %d QA items", os.path.basename(pdf_path), len(qa))
 
