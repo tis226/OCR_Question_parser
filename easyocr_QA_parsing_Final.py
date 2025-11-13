@@ -25,7 +25,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import easyocr
 import numpy as np
 import pdfplumber
-from PIL import Image
+from PIL import Image, ImageDraw
 
 
 logger = logging.getLogger(__name__)
@@ -226,6 +226,7 @@ class EasyOCRTextExtractor:
         self.reader = easyocr.Reader(list(settings.languages), gpu=settings.gpu)
         self._image_cache: Dict[int, Image.Image] = {}
         self._scale = settings.dpi / 72.0
+        self.page_word_boxes: Dict[int, List[Dict[str, object]]] = {}
         logger.debug(
             "Initialized EasyOCRTextExtractor: dpi=%s languages=%s gpu=%s",
             settings.dpi,
@@ -251,6 +252,7 @@ class EasyOCRTextExtractor:
         y_tol: float = 3.0,
         y_cut: Optional[float] = None,
         drop_zone: Optional[Tuple[float, float, float, float]] = None,
+        column_tag: Optional[str] = None,
     ) -> List[Dict[str, float]]:
         x0, y0, x1, y1 = bbox
         if y_cut is not None:
@@ -283,6 +285,7 @@ class EasyOCRTextExtractor:
         results = self.reader.readtext(np_img)
 
         entries = []
+        word_entries: List[Dict[str, object]] = []
         for pts, text, conf in results:
             if not text:
                 continue
@@ -298,15 +301,39 @@ class EasyOCRTextExtractor:
                 (abs_x0, abs_y0, abs_x1, abs_y1), drop_zone
             ):
                 continue
+            normalized_text = _normalize_visible_text(text)
             entries.append(
                 {
                     "x0": float(abs_x0),
                     "x1": float(abs_x1),
                     "top": float(abs_y0),
                     "bottom": float(abs_y1),
-                    "text": _normalize_visible_text(text),
+                    "text": normalized_text,
                 }
             )
+            poly = [
+                {
+                    "x": float(x0 + px / scale),
+                    "y": float(y0 + py / scale),
+                }
+                for px, py in pts
+            ]
+            word_entries.append(
+                {
+                    "x0": float(abs_x0),
+                    "x1": float(abs_x1),
+                    "top": float(abs_y0),
+                    "bottom": float(abs_y1),
+                    "text": normalized_text,
+                    "confidence": float(conf) if conf is not None else None,
+                    "column": column_tag,
+                    "poly": poly,
+                }
+            )
+
+        if word_entries:
+            bucket = self.page_word_boxes.setdefault(page_index, [])
+            bucket.extend(word_entries)
 
         if not entries:
             return []
@@ -453,8 +480,12 @@ def build_flow_segments(
         L, R = two_col_bboxes(page, top_frac, bottom_frac, gutter_frac)
         ycut = ycut_map.get(i + 1) if clip_mode == "ycut" else None
         band = band_map.get(i + 1) if clip_mode == "band" else None
-        L_lines = extractor.extract_lines(i, L, y_tol=y_tol, y_cut=ycut, drop_zone=band)
-        R_lines = extractor.extract_lines(i, R, y_tol=y_tol, y_cut=ycut, drop_zone=band)
+        L_lines = extractor.extract_lines(
+            i, L, y_tol=y_tol, y_cut=ycut, drop_zone=band, column_tag="L"
+        )
+        R_lines = extractor.extract_lines(
+            i, R, y_tol=y_tol, y_cut=ycut, drop_zone=band, column_tag="R"
+        )
         segs.append((i, "L", L, L_lines))
         segs.append((i, "R", R, R_lines))
     return segs
@@ -859,9 +890,92 @@ def save_searchable_pdf(
                 text_obj.textLine(text)
                 canv.drawText(text_obj)
 
-            canv.showPage()
+        canv.showPage()
 
-        canv.save()
+    canv.save()
+
+
+def save_bbox_overlay_pdf(
+    pdf_path: str,
+    out_path: str,
+    dpi: int,
+    word_map: Dict[int, List[Dict[str, object]]],
+    line_map: Optional[Dict[int, List[Dict[str, object]]]] = None,
+    word_color: Tuple[int, int, int] = (255, 0, 0),
+    line_color: Tuple[int, int, int] = (0, 128, 255),
+) -> None:
+    abs_out = os.path.abspath(os.path.expanduser(out_path))
+    ensure_dir(os.path.dirname(abs_out))
+
+    images: List[Image.Image] = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            scale = float(dpi) / 72.0
+            page_total = len(pdf.pages)
+            for page_index, page in enumerate(pdf.pages):
+                logger.debug(
+                    "Rendering OCR overlay for page %d/%d at %d DPI",
+                    page_index + 1,
+                    page_total,
+                    dpi,
+                )
+                base_img = page.to_image(resolution=int(dpi)).original.convert("RGB")
+                draw = ImageDraw.Draw(base_img)
+                stroke_words = max(1, int(round(dpi / 300)))
+                stroke_lines = max(1, int(round(dpi / 360)))
+
+                words = word_map.get(page_index) or []
+                for word in words:
+                    try:
+                        x0 = float(word.get("x0")) * scale
+                        x1 = float(word.get("x1")) * scale
+                        top = float(word.get("top")) * scale
+                        bottom = float(word.get("bottom")) * scale
+                    except (TypeError, ValueError):
+                        continue
+                    draw.rectangle((x0, top, x1, bottom), outline=word_color, width=stroke_words)
+
+                if line_map:
+                    lines = line_map.get(page_index) or []
+                    for line in lines:
+                        try:
+                            x0 = float(line.get("x0")) * scale
+                            x1 = float(line.get("x1")) * scale
+                            top = float(line.get("top")) * scale
+                            bottom = float(line.get("bottom", top)) * scale
+                        except (TypeError, ValueError):
+                            continue
+                        draw.rectangle((x0, top, x1, bottom), outline=line_color, width=stroke_lines)
+
+                del draw
+                images.append(base_img)
+    except Exception:
+        for img in images:
+            try:
+                img.close()
+            except Exception:
+                pass
+        raise
+
+    if not images:
+        logger.warning("No pages rendered for OCR overlay PDF export of %s", pdf_path)
+        return
+
+    first, rest = images[0], images[1:]
+    try:
+        first.save(
+            abs_out,
+            format="PDF",
+            save_all=True,
+            append_images=rest,
+            resolution=int(dpi),
+        )
+    finally:
+        for img in images:
+            try:
+                img.close()
+            except Exception:
+                pass
 
 
 # =========================
@@ -1020,7 +1134,12 @@ def pdf_to_qa_flow_chunks(
 
         logger.info("Accepted %d QA items after filtering", len(out))
 
-    return out, page_text_map
+        page_word_map: Dict[int, List[Dict[str, object]]] = {
+            idx: extractor.page_word_boxes.get(idx, [])
+            for idx in range(len(pdf.pages))
+        }
+
+    return out, page_text_map, page_word_map
 
 
 # =========================
@@ -1423,6 +1542,8 @@ def process_single_pdf(
     raster_pdf_dpi: Optional[int] = None,
     searchable_pdf_path: Optional[str] = None,
     searchable_pdf_dpi: Optional[int] = None,
+    bbox_overlay_pdf_path: Optional[str] = None,
+    bbox_overlay_pdf_dpi: Optional[int] = None,
 ):
     if year is None:
         year = infer_year_from_filename(pdf_path) or datetime.now().year
@@ -1474,7 +1595,7 @@ def process_single_pdf(
     heartbeat.start()
 
     try:
-        qa, page_text_map = pdf_to_qa_flow_chunks(
+        qa, page_text_map, page_word_map = pdf_to_qa_flow_chunks(
             pdf_path=pdf_path,
             year=year,
             start_num=start_num,
@@ -1515,6 +1636,16 @@ def process_single_pdf(
             page_text_map,
         )
         logger.info("Saved searchable OCR PDF to %s", searchable_pdf_path)
+    if bbox_overlay_pdf_path:
+        dpi = bbox_overlay_pdf_dpi or (ocr_settings.dpi if ocr_settings else 800)
+        save_bbox_overlay_pdf(
+            pdf_path,
+            bbox_overlay_pdf_path,
+            dpi,
+            page_word_map,
+            page_text_map,
+        )
+        logger.info("Saved OCR bounding box overlay PDF to %s", bbox_overlay_pdf_path)
     return qa
 
 
@@ -1610,6 +1741,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         help="DPI to use when rasterizing pages for the searchable PDF layer",
     )
+    ap.add_argument(
+        "--bbox-overlay-pdf-out",
+        help="Path or directory to save a PDF with OCR bounding boxes overlaid",
+    )
+    ap.add_argument(
+        "--bbox-overlay-pdf-dpi",
+        type=int,
+        help="DPI to use for the bounding-box overlay PDF (defaults to EasyOCR DPI)",
+    )
 
     ap.add_argument(
         "--margin-ui",
@@ -1662,8 +1802,8 @@ def main():
         pdfs = [args.pdf]
         out_paths = [args.out]
         batch_mode = False
+        base_pdf = os.path.splitext(os.path.basename(args.pdf))[0]
         if args.raster_pdf_out:
-            base_pdf = os.path.splitext(os.path.basename(args.pdf))[0]
             if os.path.isdir(args.raster_pdf_out) or args.raster_pdf_out.endswith(os.sep):
                 target_dir = args.raster_pdf_out
                 ensure_dir(target_dir)
@@ -1677,7 +1817,6 @@ def main():
             raster_paths = [None]
 
         if args.searchable_pdf_out:
-            base_pdf = os.path.splitext(os.path.basename(args.pdf))[0]
             if os.path.isdir(args.searchable_pdf_out) or args.searchable_pdf_out.endswith(os.sep):
                 target_dir = args.searchable_pdf_out
                 ensure_dir(target_dir)
@@ -1691,6 +1830,21 @@ def main():
                 searchable_paths = [args.searchable_pdf_out]
         else:
             searchable_paths = [None]
+
+        if args.bbox_overlay_pdf_out:
+            if os.path.isdir(args.bbox_overlay_pdf_out) or args.bbox_overlay_pdf_out.endswith(os.sep):
+                target_dir = args.bbox_overlay_pdf_out
+                ensure_dir(target_dir)
+                bbox_overlay_paths = [
+                    os.path.join(target_dir, f"{base_pdf}_ocr_overlay.pdf")
+                ]
+            else:
+                ensure_dir(
+                    os.path.dirname(os.path.abspath(args.bbox_overlay_pdf_out))
+                )
+                bbox_overlay_paths = [args.bbox_overlay_pdf_out]
+        else:
+            bbox_overlay_paths = [None]
     else:
         pdfs = list_pdfs(args.pdf_dir)
         if not pdfs:
@@ -1730,14 +1884,26 @@ def main():
         else:
             searchable_paths = [None] * len(pdfs)
 
+        if args.bbox_overlay_pdf_out:
+            ensure_dir(args.bbox_overlay_pdf_out)
+            bbox_overlay_paths = [
+                os.path.join(
+                    args.bbox_overlay_pdf_out,
+                    os.path.splitext(os.path.basename(p))[0] + "_ocr_overlay.pdf",
+                )
+                for p in pdfs
+            ]
+        else:
+            bbox_overlay_paths = [None] * len(pdfs)
+
     ocr_settings = OCRSettings(
         dpi=args.easyocr_dpi,
         languages=[lang.strip() for lang in args.easyocr_langs.split(",") if lang.strip()],
         gpu=args.easyocr_gpu,
     )
 
-    for pdf_path, out_path, raster_path, searchable_path in zip(
-        pdfs, out_paths, raster_paths, searchable_paths
+    for pdf_path, out_path, raster_path, searchable_path, bbox_overlay_path in zip(
+        pdfs, out_paths, raster_paths, searchable_paths, bbox_overlay_paths
     ):
         logger.info("Processing %s -> %s", os.path.basename(pdf_path), out_path)
         if raster_path:
@@ -1749,6 +1915,11 @@ def main():
             logger.info(
                 "Searchable OCR PDF will be saved to %s",
                 searchable_path,
+            )
+        if bbox_overlay_path:
+            logger.info(
+                "OCR bounding-box overlay will be saved to %s",
+                bbox_overlay_path,
             )
         debug_dir = None
         if args.chunk_debug_dir:
@@ -1787,6 +1958,8 @@ def main():
             raster_pdf_dpi=args.raster_pdf_dpi,
             searchable_pdf_path=searchable_path,
             searchable_pdf_dpi=args.searchable_pdf_dpi,
+            bbox_overlay_pdf_path=bbox_overlay_path,
+            bbox_overlay_pdf_dpi=args.bbox_overlay_pdf_dpi,
         )
         logger.info("Completed %s with %d QA items", os.path.basename(pdf_path), len(qa))
 
