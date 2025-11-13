@@ -829,24 +829,29 @@ def interactive_margin_selection(
     if page_index < 0:
         raise ValueError("page_index must be >= 0")
 
-    with pdfplumber.open(pdf_path) as pdf:
-        if page_index >= len(pdf.pages):
+    pdf = pdfplumber.open(pdf_path)
+    try:
+        page_count = len(pdf.pages)
+        if page_index >= page_count:
             raise ValueError("page_index exceeds total page count")
-        page = pdf.pages[page_index]
-        L_bbox, R_bbox = two_col_bboxes(page, top_frac, bottom_frac, gutter_frac)
-        base_img = (
-            page.to_image(resolution=int(render_dpi)).original.convert("RGB")
-        )
-        base_w, base_h = base_img.size
-        pdf_w, pdf_h = float(page.width), float(page.height)
-
-    scale_x = base_w / pdf_w if pdf_w else 1.0
-    scale_y = base_h / pdf_h if pdf_h else 1.0
+    except Exception:
+        pdf.close()
+        raise
 
     state = {
         "zoom": 1.0,
-        "left_pdf_x": None if initial_left is None else (L_bbox[0] + initial_left),
-        "right_pdf_x": None if initial_right is None else (R_bbox[0] + initial_right),
+        "page_index": page_index,
+        "left_offset": initial_left,
+        "right_offset": initial_right,
+        "left_pdf_x": None,
+        "right_pdf_x": None,
+        "base_img": None,
+        "base_w": None,
+        "base_h": None,
+        "scale_x": 1.0,
+        "scale_y": 1.0,
+        "L_bbox": None,
+        "R_bbox": None,
         "result": None,
     }
 
@@ -881,13 +886,21 @@ def interactive_margin_selection(
 
     def pdf_to_canvas_coords(x: float, y: float) -> Tuple[float, float]:
         zoom = state["zoom"]
-        return x * scale_x * zoom, y * scale_y * zoom
+        return (
+            x * state["scale_x"] * zoom,
+            y * state["scale_y"] * zoom,
+        )
 
     def refresh_image(*_):
+        base_img = state.get("base_img")
+        if base_img is None:
+            return
         zoom = zoom_var.get() / 100.0
         if zoom <= 0:
             zoom = 0.1
         state["zoom"] = zoom
+        base_w = state.get("base_w") or base_img.width
+        base_h = state.get("base_h") or base_img.height
         disp_w = max(1, int(round(base_w * zoom)))
         disp_h = max(1, int(round(base_h * zoom)))
         resized = base_img.resize((disp_w, disp_h), Image.LANCZOS)
@@ -904,6 +917,10 @@ def interactive_margin_selection(
     def draw_overlays():
         canvas.delete("overlay")
         zoom = state["zoom"]
+        L_bbox = state.get("L_bbox")
+        R_bbox = state.get("R_bbox")
+        if L_bbox is None or R_bbox is None:
+            return
         for tag, bbox, color in (
             ("L", L_bbox, "#33aaff"),
             ("R", R_bbox, "#ff9933"),
@@ -969,20 +986,26 @@ def interactive_margin_selection(
         canvas_x = canvas.canvasx(event.x)
         canvas_y = canvas.canvasy(event.y)
         zoom = state["zoom"]
-        pdf_x = canvas_x / (scale_x * zoom)
-        pdf_y = canvas_y / (scale_y * zoom)
+        pdf_x = canvas_x / (state["scale_x"] * zoom)
+        pdf_y = canvas_y / (state["scale_y"] * zoom)
+        L_bbox = state.get("L_bbox")
+        R_bbox = state.get("R_bbox")
+        if L_bbox is None or R_bbox is None:
+            return
         side = selection_var.get()
         if side == "L":
             if not (L_bbox[0] <= pdf_x <= L_bbox[2]):
                 status_var.set("Click inside the highlighted left column.")
                 return
             state["left_pdf_x"] = pdf_x
+            state["left_offset"] = pdf_x - L_bbox[0]
             status_var.set(f"Left margin set at x={pdf_x:.2f} pt (y={pdf_y:.2f})")
         else:
             if not (R_bbox[0] <= pdf_x <= R_bbox[2]):
                 status_var.set("Click inside the highlighted right column.")
                 return
             state["right_pdf_x"] = pdf_x
+            state["right_offset"] = pdf_x - R_bbox[0]
             status_var.set(f"Right margin set at x={pdf_x:.2f} pt (y={pdf_y:.2f})")
         draw_overlays()
 
@@ -993,14 +1016,12 @@ def interactive_margin_selection(
             selection_var.set("R")
 
     def confirm():
-        if state["left_pdf_x"] is None or state["right_pdf_x"] is None:
+        if state["left_offset"] is None or state["right_offset"] is None:
             messagebox.showwarning(
                 "Incomplete", "Set both left and right margins before continuing."
             )
             return
-        left_offset = state["left_pdf_x"] - L_bbox[0]
-        right_offset = state["right_pdf_x"] - R_bbox[0]
-        state["result"] = (left_offset, right_offset)
+        state["result"] = (state["left_offset"], state["right_offset"])
         root.destroy()
 
     def cancel():
@@ -1043,21 +1064,86 @@ def interactive_margin_selection(
     )
     ttk.Button(controls, text="Apply", command=confirm).grid(row=0, column=8)
 
+    page_info_var = tk.StringVar()
+
+    def change_page(delta: int):
+        new_index = state["page_index"] + delta
+        if new_index < 0 or new_index >= page_count:
+            return
+        load_page(new_index)
+
+    ttk.Separator(controls, orient="horizontal").grid(
+        row=1, column=0, columnspan=9, sticky="ew", pady=(6, 6)
+    )
+    ttk.Label(controls, textvariable=page_info_var).grid(
+        row=2, column=0, columnspan=3, sticky="w"
+    )
+    ttk.Button(controls, text="◀ Prev", command=lambda: change_page(-1)).grid(
+        row=2, column=3, padx=(4, 4)
+    )
+    ttk.Button(controls, text="Next ▶", command=lambda: change_page(1)).grid(
+        row=2, column=4, padx=(4, 12)
+    )
+    controls.columnconfigure(1, weight=1)
+    controls.columnconfigure(6, weight=1)
+
     status = ttk.Label(main_frame, textvariable=status_var, anchor="w")
     status.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
     def reset_lines():
         state["left_pdf_x"] = None
         state["right_pdf_x"] = None
+        state["left_offset"] = None
+        state["right_offset"] = None
         status_var.set("Margins cleared. Click to set new positions.")
         draw_overlays()
 
-    refresh_image()
-    root.mainloop()
+    def load_page(idx: int):
+        if not (0 <= idx < page_count):
+            return
+        page = pdf.pages[idx]
+        L_bbox, R_bbox = two_col_bboxes(page, top_frac, bottom_frac, gutter_frac)
+        base_img = page.to_image(resolution=int(render_dpi)).original.convert("RGB")
+        base_w, base_h = base_img.size
+        pdf_w, pdf_h = float(page.width), float(page.height)
+        scale_x = base_w / pdf_w if pdf_w else 1.0
+        scale_y = base_h / pdf_h if pdf_h else 1.0
 
-    if state["result"] is None:
-        raise RuntimeError("Margin selection cancelled")
-    return state["result"]
+        state["page_index"] = idx
+        state["base_img"] = base_img
+        state["base_w"] = base_w
+        state["base_h"] = base_h
+        state["scale_x"] = scale_x
+        state["scale_y"] = scale_y
+        state["L_bbox"] = L_bbox
+        state["R_bbox"] = R_bbox
+        if state["left_offset"] is not None:
+            state["left_pdf_x"] = L_bbox[0] + state["left_offset"]
+        else:
+            state["left_pdf_x"] = None
+        if state["right_offset"] is not None:
+            state["right_pdf_x"] = R_bbox[0] + state["right_offset"]
+        else:
+            state["right_pdf_x"] = None
+
+        page_info_var.set(f"Page {idx + 1} / {page_count}")
+        status_var.set(
+            "Click inside a column to set a margin line."
+            if state["left_offset"] is None or state["right_offset"] is None
+            else "Margins loaded. Adjust as needed then click Apply."
+        )
+        refresh_image()
+
+    try:
+        load_page(state["page_index"])
+
+        root.mainloop()
+
+        if state["result"] is None:
+            raise RuntimeError("Margin selection cancelled")
+        return state["result"]
+    finally:
+        pdf.close()
 
 
 def process_single_pdf(
