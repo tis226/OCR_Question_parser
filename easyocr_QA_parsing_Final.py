@@ -456,6 +456,16 @@ def flow_chunk_all_pages(
         else:
             margin_abs = None if R_rel_offset is None else (R[0] + R_rel_offset)
             col_left = R[0]
+        if logger.isEnabledFor(logging.DEBUG):
+            rel_offset = L_rel_offset if col == "L" else R_rel_offset
+            logger.debug(
+                "Page %d column %s bbox=%s margin_abs=%s rel_offset=%s",
+                pi + 1,
+                col,
+                tuple(round(v, 2) for v in bbox),
+                None if margin_abs is None else round(margin_abs, 2),
+                None if rel_offset is None else round(rel_offset, 2),
+            )
         seg_meta.append((pi, col, bbox, lines, margin_abs, col_left))
 
     seg_starts = []
