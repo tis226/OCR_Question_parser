@@ -22,7 +22,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-import easyocr
+try:  # EasyOCR is only needed at runtime; allow import for tooling/tests without it.
+    import easyocr  # type: ignore
+except Exception:  # pragma: no cover - handled lazily when constructing the reader.
+    easyocr = None  # type: ignore[assignment]
 import numpy as np
 import pdfplumber
 from PIL import Image, ImageDraw
@@ -177,6 +180,8 @@ def _strip_header_garbage(text: str) -> str:
 
 def _normalize_option_markers(text: str) -> str:
     def repl(match: re.Match) -> str:
+        if match.start() == 0:
+            return match.group(0)
         num = match.group(1)
         circled = DIGIT_TO_CIRCLED.get(num)
         if not circled or circled == num:
@@ -221,6 +226,10 @@ class EasyOCRTextExtractor:
     """Render PDF pages to images and run EasyOCR within bboxes."""
 
     def __init__(self, pdf: pdfplumber.pdf.PDF, settings: OCRSettings):
+        if easyocr is None:
+            raise ImportError(
+                "easyocr is not installed. Install it with 'pip install easyocr' to use this script."
+            )
         self.pdf = pdf
         self.settings = settings
         self.reader = easyocr.Reader(list(settings.languages), gpu=settings.gpu)
@@ -787,6 +796,119 @@ def format_qa_items_as_text(qa_items: Sequence[Dict[str, object]]) -> str:
         lines.append("")
 
     return "\n".join(lines)
+
+
+@dataclass
+class QAValidationResult:
+    total_items: int
+    numbered_items: int
+    first_number: Optional[int]
+    last_number: Optional[int]
+    missing_numbers: List[int]
+    duplicate_numbers: List[int]
+    out_of_order_pairs: List[Tuple[int, int]]
+    expected_count: Optional[int] = None
+    start_number: Optional[int] = None
+
+    def is_complete(self) -> bool:
+        baseline_ok = self.total_items > 0 or (self.expected_count == 0)
+        return (
+            baseline_ok
+            and not self.missing_numbers
+            and not self.duplicate_numbers
+            and not self.out_of_order_pairs
+            and not self.count_mismatch()
+        )
+
+    def count_mismatch(self) -> bool:
+        return self.expected_count is not None and self.total_items != self.expected_count
+
+
+def validate_qa_sequence(
+    qa_items: Sequence[Dict[str, object]],
+    expected_count: Optional[int] = None,
+    start_number: Optional[int] = None,
+) -> QAValidationResult:
+    items = list(qa_items or [])
+    numbers: List[int] = []
+    counts: Dict[int, int] = {}
+    out_of_order: List[Tuple[int, int]] = []
+    last_seen: Optional[int] = None
+
+    for item in items:
+        content = item.get("content") if isinstance(item, dict) else None
+        if not isinstance(content, dict):
+            continue
+        qnum = content.get("question_number")
+        if not isinstance(qnum, int):
+            continue
+        numbers.append(qnum)
+        counts[qnum] = counts.get(qnum, 0) + 1
+        if last_seen is not None and qnum < last_seen:
+            out_of_order.append((last_seen, qnum))
+        last_seen = qnum
+
+    duplicates = sorted({num for num, count in counts.items() if count > 1})
+
+    missing: List[int] = []
+    if numbers:
+        numbers_sorted = sorted(set(numbers))
+        first = numbers_sorted[0]
+        last = numbers_sorted[-1]
+        missing.extend(n for n in range(first, last + 1) if counts.get(n, 0) == 0)
+    else:
+        first = start_number
+        last = None
+
+    if expected_count is not None and start_number is not None:
+        expected_last = start_number + max(expected_count - 1, 0)
+        missing.extend(
+            n
+            for n in range(start_number, expected_last + 1)
+            if counts.get(n, 0) == 0 and n not in missing
+        )
+    missing.sort()
+
+    return QAValidationResult(
+        total_items=len(items),
+        numbered_items=len(numbers),
+        first_number=first,
+        last_number=last,
+        missing_numbers=missing,
+        duplicate_numbers=duplicates,
+        out_of_order_pairs=out_of_order,
+        expected_count=expected_count,
+        start_number=start_number,
+    )
+
+
+def log_validation_summary(result: QAValidationResult, label: str) -> None:
+    base_msg = (
+        f"Validation summary for {label}: {result.total_items} total items, "
+        f"{result.numbered_items} numbered"
+    )
+    range_msg = ""
+    if result.first_number is not None and result.last_number is not None:
+        range_msg = f", range {result.first_number}-{result.last_number}"
+    logger.info("%s%s", base_msg, range_msg)
+
+    if result.total_items == 0:
+        logger.warning("No QA items detected for %s", label)
+
+    if result.count_mismatch():
+        logger.warning(
+            "Expected %d items but produced %d", result.expected_count, result.total_items
+        )
+
+    if result.missing_numbers:
+        logger.warning("Missing question numbers: %s", ", ".join(map(str, result.missing_numbers)))
+
+    if result.duplicate_numbers:
+        logger.warning("Duplicate question numbers detected: %s", ", ".join(map(str, result.duplicate_numbers)))
+
+    if result.out_of_order_pairs:
+        formatted = ", ".join(f"{a}->{b}" for a, b in result.out_of_order_pairs)
+        logger.warning("Out-of-order question numbers: %s", formatted)
 
 
 # =========================
@@ -1595,6 +1717,8 @@ def process_single_pdf(
     bbox_overlay_pdf_path: Optional[str] = None,
     bbox_overlay_pdf_dpi: Optional[int] = None,
     text_out_path: Optional[str] = None,
+    expected_question_count: Optional[int] = None,
+    fail_on_incomplete: bool = False,
 ):
     if year is None:
         year = infer_year_from_filename(pdf_path) or datetime.now().year
@@ -1703,7 +1827,14 @@ def process_single_pdf(
             page_text_map,
         )
         logger.info("Saved OCR bounding box overlay PDF to %s", bbox_overlay_pdf_path)
-    return qa
+    validation = validate_qa_sequence(qa, expected_question_count, start_num)
+    log_validation_summary(validation, os.path.basename(pdf_path))
+    if fail_on_incomplete and not validation.is_complete():
+        raise RuntimeError(
+            "Validation failed: gaps, duplicates, or count mismatch detected in parsed QA items"
+        )
+
+    return qa, validation
 
 
 # =========================
@@ -1811,6 +1942,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--text-out",
         help="Path or directory to save a combined plain-text export of parsed QAs",
+    )
+
+    ap.add_argument(
+        "--expected-question-count",
+        type=int,
+        help="Expected number of QA items; used for validation reporting",
+    )
+    ap.add_argument(
+        "--fail-on-incomplete",
+        action="store_true",
+        help=(
+            "Exit with an error if validation finds missing, duplicate, out-of-order, or mismatched question counts"
+        ),
     )
 
     ap.add_argument(
@@ -2031,12 +2175,13 @@ def main():
             else:
                 debug_dir = base_debug
             ensure_dir(debug_dir)
-        qa = process_single_pdf(
-            pdf_path=pdf_path,
-            out_path=out_path,
-            year=args.year,
-            start_num=args.start_num,
-            tol=args.tol,
+        try:
+            qa, validation = process_single_pdf(
+                pdf_path=pdf_path,
+                out_path=out_path,
+                year=args.year,
+                start_num=args.start_num,
+                tol=args.tol,
             top_frac=args.top_frac,
             bottom_frac=args.bottom_frac,
             gutter_frac=args.gutter_frac,
@@ -2055,13 +2200,27 @@ def main():
             failed_chunk_log_chars=args.failed_chunk_log_chars,
             raster_pdf_path=raster_path,
             raster_pdf_dpi=args.raster_pdf_dpi,
-            searchable_pdf_path=searchable_path,
-            searchable_pdf_dpi=args.searchable_pdf_dpi,
-            bbox_overlay_pdf_path=bbox_overlay_path,
-            bbox_overlay_pdf_dpi=args.bbox_overlay_pdf_dpi,
-            text_out_path=text_path,
-        )
+                searchable_pdf_path=searchable_path,
+                searchable_pdf_dpi=args.searchable_pdf_dpi,
+                bbox_overlay_pdf_path=bbox_overlay_path,
+                bbox_overlay_pdf_dpi=args.bbox_overlay_pdf_dpi,
+                text_out_path=text_path,
+                expected_question_count=args.expected_question_count,
+                fail_on_incomplete=args.fail_on_incomplete,
+            )
+        except RuntimeError as exc:
+            logger.error("Validation failed for %s: %s", pdf_path, exc)
+            if args.fail_on_incomplete:
+                sys.exit(4)
+            raise
         logger.info("Completed %s with %d QA items", os.path.basename(pdf_path), len(qa))
+        if args.expected_question_count and validation.count_mismatch():
+            logger.warning(
+                "Expected %d QA items but parsed %d from %s",
+                args.expected_question_count,
+                len(qa),
+                os.path.basename(pdf_path),
+            )
 
     if batch_mode:
         logger.info("Batch finished")
