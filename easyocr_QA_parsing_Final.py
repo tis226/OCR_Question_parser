@@ -13,8 +13,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import re
+import statistics
 import sys
 import threading
 import unicodedata
@@ -732,6 +734,11 @@ def flow_chunk_all_pages(
                     top = min(l["top"] for l in block) - 2.0
                     bot = max(l["bottom"] for l in block) + 2.0
                     text = "\n".join(l["text"] for l in block)
+                    piece_lines = []
+                    for l in block:
+                        copy = dict(l)
+                        copy.setdefault("column", col)
+                        piece_lines.append(copy)
                     current["pieces"].append(
                         {
                             "page": pi,
@@ -740,6 +747,7 @@ def flow_chunk_all_pages(
                             "start_line": i,
                             "end_line": end_idx,
                             "text": text,
+                            "lines": piece_lines,
                         }
                     )
                 i = end_idx + 1
@@ -763,6 +771,140 @@ def flow_chunk_all_pages(
 # =========================
 # QA extraction helpers
 # =========================
+
+
+def _safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    if math.isinf(result) or math.isnan(result):
+        return default
+    return result
+
+
+def _median_or_default(values: Sequence[float], default: float) -> float:
+    filtered = [v for v in values if not math.isinf(v) and not math.isnan(v)]
+    if not filtered:
+        return default
+    try:
+        return float(statistics.median(filtered))
+    except statistics.StatisticsError:
+        return default
+
+
+def _infer_options_from_lines(
+    text: str, lines: Optional[Sequence[Dict[str, object]]]
+) -> Optional[Tuple[str, List[Dict[str, str]]]]:
+    if not lines:
+        return None
+
+    cleaned: List[Dict[str, object]] = []
+    for entry in lines:
+        raw_text = entry.get("text") or ""
+        normalized = norm_space(_normalize_visible_text(str(raw_text)))
+        if not normalized:
+            continue
+        cleaned.append(
+            {
+                "text": normalized,
+                "x0": _safe_float(entry.get("x0"), 0.0),
+                "x1": _safe_float(entry.get("x1"), 0.0),
+                "top": _safe_float(entry.get("top"), 0.0),
+                "bottom": _safe_float(entry.get("bottom"), 0.0),
+            }
+        )
+
+    if len(cleaned) < 4:
+        return None
+
+    q_start_idx = next(
+        (i for i, item in enumerate(cleaned) if QUESTION_START_LINE_RE.match(item["text"])),
+        0,
+    )
+    relevant = cleaned[q_start_idx:]
+    if len(relevant) < 4:
+        return None
+
+    heights = [max(it["bottom"] - it["top"], 0.5) for it in relevant]
+    line_height = _median_or_default(heights, 12.0)
+    gap_threshold = max(line_height * 1.35, 6.0)
+
+    option_start = None
+    for idx in range(1, len(relevant)):
+        prev = relevant[idx - 1]
+        cur = relevant[idx]
+        gap = cur["top"] - prev["bottom"]
+        if gap > gap_threshold:
+            option_start = idx
+            break
+
+    if option_start is None:
+        total = len(relevant)
+        for start in range(total - 3, 0, -1):
+            tail = relevant[start:]
+            if len(tail) < 3 or len(tail) > 7:
+                continue
+            short_ratio = sum(1 for item in tail if len(item["text"]) <= 36) / len(tail)
+            if short_ratio >= 0.6:
+                option_start = start
+                break
+
+    if option_start is None:
+        return None
+
+    stem_lines = relevant[:option_start]
+    option_lines = relevant[option_start:]
+    if len(option_lines) < 3:
+        return None
+
+    base_indent = _median_or_default([ln["x0"] for ln in option_lines], option_lines[0]["x0"])
+    indent_threshold = max(2.5, line_height * 0.2)
+
+    grouped: List[List[str]] = []
+    current: List[str] = []
+    for line in option_lines:
+        txt = line["text"]
+        indent = line["x0"]
+        new_option = False
+        if not current:
+            new_option = True
+        elif indent <= base_indent + indent_threshold:
+            new_option = True
+        else:
+            new_option = False
+
+        if new_option and current:
+            grouped.append(current)
+            current = []
+        current.append(txt)
+
+    if current:
+        grouped.append(current)
+
+    grouped = [grp for grp in grouped if grp]
+    if len(grouped) < 3:
+        return None
+
+    stem_text = "\n".join(line["text"] for line in stem_lines).strip()
+    if not stem_text:
+        text_lines = [ln for ln in text.splitlines() if ln.strip()]
+        if len(text_lines) > len(grouped):
+            stem_text = "\n".join(text_lines[: len(text_lines) - len(grouped)]).strip()
+
+    options: List[Dict[str, str]] = []
+    for idx, lines_group in enumerate(grouped, start=1):
+        opt_text = norm_space(" ".join(lines_group))
+        if not opt_text:
+            continue
+        circled = DIGIT_TO_CIRCLED.get(str(idx), str(idx))
+        options.append({"index": circled, "text": opt_text})
+
+    if len(options) < 3:
+        return None
+
+    return stem_text, options
+
 
 def parse_dispute(stem: str, keep_text: bool = True):
     if not stem:
@@ -847,7 +989,9 @@ def sanitize_chunk_text(text: str, expected_next_qnum: Optional[int]) -> str:
     return text
 
 
-def extract_qa_from_chunk_text(text: str):
+def extract_qa_from_chunk_text(
+    text: str, lines: Optional[Sequence[Dict[str, object]]] = None
+):
     if not text:
         return None, None, False, None, None
 
@@ -855,35 +999,49 @@ def extract_qa_from_chunk_text(text: str):
     text = _strip_header_garbage(text)
 
     first_match = re.search(rf"[{OPTION_CLASS}]", text)
-    if not first_match:
+    if first_match:
+        first = first_match.start()
+        stem, opts_blob = text[:first], text[first:]
+
+        dispute, dispute_site, stem = parse_dispute(stem, keep_text=True)
+        stem = norm_space(stem)
+
+        detected_qnum, stem = extract_leading_qnum_and_clean(stem)
+        stem = norm_space(stem)
+
+        parts = [p for p in OPT_SPLIT_RE.split(opts_blob) if p]
+        options = []
+        i = 0
+        while i < len(parts):
+            sym = parts[i].strip()
+            if sym and sym[0] in OPTION_SET:
+                raw_txt = parts[i + 1] if (i + 1) < len(parts) else ""
+                clean_txt = norm_space(CIRCLED_STRIP_RE.sub("", raw_txt))
+                options.append({"index": sym[0], "text": clean_txt})
+                i += 2
+            else:
+                i += 1
+        options = [o for o in options if o["index"] in OPTION_SET]
+        if not options:
+            return None, None, dispute, dispute_site, detected_qnum
+
+        return stem, options, dispute, dispute_site, detected_qnum
+
+    fallback = _infer_options_from_lines(text, lines)
+    if not fallback:
         return None, None, False, None, None
 
-    first = first_match.start()
-    stem, opts_blob = text[:first], text[first:]
+    stem_text, fallback_options = fallback
+    dispute, dispute_site, stem_text = parse_dispute(stem_text, keep_text=True)
+    stem_text = norm_space(stem_text)
+    detected_qnum, stem_text = extract_leading_qnum_and_clean(stem_text)
+    stem_text = norm_space(stem_text)
 
-    dispute, dispute_site, stem = parse_dispute(stem, keep_text=True)
-    stem = norm_space(stem)
+    logger.debug(
+        "Fallback option reconstruction applied (options=%d)", len(fallback_options)
+    )
 
-    detected_qnum, stem = extract_leading_qnum_and_clean(stem)
-    stem = norm_space(stem)
-
-    parts = [p for p in OPT_SPLIT_RE.split(opts_blob) if p]
-    options = []
-    i = 0
-    while i < len(parts):
-        sym = parts[i].strip()
-        if sym and sym[0] in OPTION_SET:
-            raw_txt = parts[i + 1] if (i + 1) < len(parts) else ""
-            clean_txt = norm_space(CIRCLED_STRIP_RE.sub("", raw_txt))
-            options.append({"index": sym[0], "text": clean_txt})
-            i += 2
-        else:
-            i += 1
-    options = [o for o in options if o["index"] in OPTION_SET]
-    if not options:
-        return None, None, dispute, dispute_site, detected_qnum
-
-    return stem, options, dispute, dispute_site, detected_qnum
+    return stem_text, fallback_options, dispute, dispute_site, detected_qnum
 
 
 def format_qa_items_as_text(qa_items: Sequence[Dict[str, object]]) -> str:
@@ -1502,8 +1660,17 @@ def pdf_to_qa_flow_chunks(
                     fh.write(raw_text)
                 with open(clean_path, "w", encoding="utf-8") as fh:
                     fh.write(text)
+            chunk_lines: List[Dict[str, object]] = []
+            for piece in pieces:
+                for ln in piece.get("lines") or []:
+                    copy = dict(ln)
+                    copy.setdefault("page", piece.get("page"))
+                    chunk_lines.append(copy)
+            if chunk_lines:
+                chunk_lines.sort(key=lambda ln: (ln.get("top", 0.0), ln.get("x0", 0.0)))
+
             stem, options, dispute, dispute_site, detected_qnum = (
-                extract_qa_from_chunk_text(text)
+                extract_qa_from_chunk_text(text, chunk_lines)
             )
             if stem is None or not options:
                 snippet = text.strip().replace("\n", " ")
