@@ -2171,9 +2171,9 @@ def interactive_chunk_selection(
         page_info_var = tk.StringVar(value="Page 1 / %d" % page_count)
         zoom_var = tk.DoubleVar(value=100.0)
         zoom_display_var = tk.StringVar(value="100%")
-        progress_var = tk.StringVar(value="Assigned 0 question(s)")
+        progress_var = tk.StringVar(value="Assigned 0 question(s). Current: -")
         total_questions_var = tk.StringVar()
-        next_question_var = tk.StringVar()
+        current_question_var = tk.StringVar()
 
         photo_cache: Dict[str, Any] = {}
 
@@ -2192,9 +2192,9 @@ def interactive_chunk_selection(
         def sync_current_entry():
             current = state.get("current_qnum")
             if current is None:
-                next_question_var.set("")
+                current_question_var.set("")
             else:
-                next_question_var.set(str(current))
+                current_question_var.set(str(current))
 
         def recalc_number_state():
             expected = state.get("expected_total")
@@ -2207,7 +2207,7 @@ def interactive_chunk_selection(
                     state["current_qnum"] = available[0] if available else None
                 current = state.get("current_qnum")
                 progress_var.set(
-                    "Assigned %d/%d • Next: %s"
+                    "Assigned %d/%d • Current: %s"
                     % (len(used_set), expected, str(current) if current is not None else "-")
                 )
             else:
@@ -2216,13 +2216,10 @@ def interactive_chunk_selection(
                 if current is None or current in used_set:
                     state["current_qnum"] = state.get("next_qid", 1)
                 current = state.get("current_qnum")
-                if current is None:
-                    progress_var.set("Assigned %d question(s)" % len(used_set))
-                else:
-                    progress_var.set(
-                        "Assigned %d question(s) • Next: %s"
-                        % (len(used_set), current)
-                    )
+                progress_var.set(
+                    "Assigned %d question(s). Current: %s"
+                    % (len(used_set), str(current) if current is not None else "-")
+                )
             sync_current_entry()
 
         def pick_question_number() -> int:
@@ -2277,17 +2274,19 @@ def interactive_chunk_selection(
             recalc_number_state()
             set_status(f"Expecting {total} total questions; numbering updated.")
 
-        def set_next_question_number():
-            raw = next_question_var.get().strip()
+        def apply_current_question_number():
+            raw = current_question_var.get().strip()
             if not raw:
                 state["current_qnum"] = None
                 recalc_number_state()
-                set_status("Cleared manual next question number.")
+                set_status("Cleared current question number hint.")
                 return
             try:
                 value = int(raw)
             except ValueError:
-                messagebox.showerror("Invalid input", "Next question number must be an integer.")
+                messagebox.showerror(
+                    "Invalid input", "Current question number must be an integer."
+                )
                 return
             if value <= 0:
                 messagebox.showerror(
@@ -2302,7 +2301,8 @@ def interactive_chunk_selection(
                 )
                 return
             used_set = state.get("used_qnums", set())
-            if value in used_set:
+            selected_id = state.get("selected_qid")
+            if value in used_set and value != selected_id:
                 messagebox.showerror(
                     "Already used",
                     f"Question number {value} is already assigned. Choose another.",
@@ -2310,7 +2310,7 @@ def interactive_chunk_selection(
                 return
             state["current_qnum"] = value
             recalc_number_state()
-            set_status(f"Next question will use number {value}.")
+            set_status(f"Current question number set to {value}.")
 
         def assign_selected_question_number():
             q = get_selected_question()
@@ -2319,7 +2319,7 @@ def interactive_chunk_selection(
                     "No selection", "Select a question region before assigning a number."
                 )
                 return
-            raw = next_question_var.get().strip()
+            raw = current_question_var.get().strip()
             if not raw:
                 messagebox.showerror(
                     "Missing number", "Enter a question number to assign to the selection."
@@ -2828,18 +2828,16 @@ def interactive_chunk_selection(
         ttk.Label(controls, textvariable=progress_var).grid(
             row=3, column=3, columnspan=2, sticky="w"
         )
-        ttk.Label(controls, text="Next number:").grid(row=3, column=5, sticky="e")
-        next_entry = ttk.Entry(controls, textvariable=next_question_var, width=6)
-        next_entry.grid(row=3, column=6, sticky="w")
-        ttk.Button(controls, text="Set next", command=set_next_question_number).grid(
-            row=3, column=7, padx=(4, 4), sticky="w"
-        )
-        next_entry.bind("<Return>", lambda _evt: set_next_question_number())
+        ttk.Label(controls, text="Current number:").grid(row=3, column=5, sticky="e")
+        number_entry = ttk.Entry(controls, textvariable=current_question_var, width=6)
+        number_entry.grid(row=3, column=6, sticky="w")
+        number_entry.bind("<Return>", lambda _evt: apply_current_question_number())
+        number_entry.bind("<FocusOut>", lambda _evt: apply_current_question_number())
         ttk.Button(
             controls,
             text="Assign selected",
             command=assign_selected_question_number,
-        ).grid(row=3, column=8, padx=(4, 0), sticky="w")
+        ).grid(row=3, column=7, padx=(4, 0), sticky="w")
     
         status_label = ttk.Label(main_frame, textvariable=status_var, anchor="w")
         status_label.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
