@@ -2280,6 +2280,27 @@ def interactive_chunk_selection(
                 candidate += 1
             return candidate
 
+        def remove_question_region(
+            region: ManualQuestionRegion, *, quiet: bool = False
+        ) -> bool:
+            page_regions = questions_for_page(region.page_index)
+            try:
+                page_regions.remove(region)
+            except ValueError:
+                return False
+            if state.get("selected_qid") == region.id:
+                state["selected_qid"] = None
+            recompute_used_numbers()
+            recalc_number_state()
+            update_selection_label()
+            draw_overlays()
+            if not quiet:
+                set_status(
+                    "Removed question #%d from page %d."
+                    % (region.id, region.page_index + 1)
+                )
+            return True
+
         def resolve_number_conflict(
             value: int, keep: Optional[ManualQuestionRegion]
         ) -> Tuple[bool, Optional[str]]:
@@ -2288,17 +2309,18 @@ def interactive_chunk_selection(
                 return True, None
             prompt = (
                 "Question number %d is already assigned to page %d. "
-                "Reassign it to a new number?"
+                "Replace the existing region with the new one?"
                 % (value, existing.page_index + 1)
             )
-            if not messagebox.askyesno("Reassign question number?", prompt):
+            if not messagebox.askyesno("Replace question region?", prompt):
                 return False, None
-            new_id = allocate_unused_question_id(existing)
-            previous_id = existing.id
-            existing.id = new_id
-            if state.get("selected_qid") == previous_id and existing is not keep:
-                state["selected_qid"] = new_id
-            return True, f"Reassigned previous question #{previous_id} to #{new_id}."
+            removed = remove_question_region(existing, quiet=True)
+            if not removed:
+                return False, None
+            return True, (
+                "Removed previous question #%d from page %d."
+                % (existing.id, existing.page_index + 1)
+            )
 
         def sync_current_entry():
             current = state.get("current_qnum")
@@ -2821,17 +2843,10 @@ def interactive_chunk_selection(
             if q is None:
                 set_status("No question selected to delete.")
                 return
-            qlist = questions_for_page(state["page_index"])
-            try:
-                qlist.remove(q)
-            except ValueError:
-                pass
-            state["selected_qid"] = None
-            recompute_used_numbers()
-            recalc_number_state()
-            update_selection_label()
-            draw_overlays()
-            set_status("Deleted selected question region.")
+            if remove_question_region(q, quiet=True):
+                set_status("Deleted selected question region.")
+            else:
+                set_status("Unable to delete the selected question region.")
     
         def clear_selected_options():
             q = get_selected_question()
