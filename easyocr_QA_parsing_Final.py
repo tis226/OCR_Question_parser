@@ -742,6 +742,53 @@ def extract_qa_from_chunk_text(text: str):
     return stem, options, dispute, dispute_site, detected_qnum
 
 
+def format_qa_items_as_text(qa_items: Sequence[Dict[str, object]]) -> str:
+    lines: List[str] = []
+    for item in qa_items or []:
+        content = item.get("content") if isinstance(item, dict) else None
+        if not isinstance(content, dict):
+            continue
+
+        qnum = content.get("question_number")
+        stem = content.get("question_text") or ""
+        dispute = bool(content.get("dispute_bool"))
+        dispute_site = content.get("dispute_site") or ""
+        options = content.get("options") or []
+
+        stem_lines = (stem.splitlines() if stem else [])
+        if qnum is not None:
+            if stem_lines:
+                lines.append(f"{qnum}. {stem_lines[0]}".rstrip())
+                lines.extend(stem_lines[1:])
+            else:
+                lines.append(f"{qnum}.")
+        else:
+            lines.extend(stem_lines)
+
+        if dispute:
+            tag = "[Dispute]" if not dispute_site else f"[Dispute] {dispute_site}"
+            lines.append(tag.strip())
+
+        for opt in options:
+            if not isinstance(opt, dict):
+                continue
+            idx = (opt.get("index") or "").strip()
+            text = opt.get("text") or ""
+            opt_lines = text.splitlines() if text else [""]
+            if opt_lines:
+                first_line = opt_lines[0]
+                prefix = f"{idx} " if idx else ""
+                lines.append(f"{prefix}{first_line}".rstrip())
+                lines.extend(opt_lines[1:])
+
+        lines.append("")
+
+    if lines and lines[-1] != "":
+        lines.append("")
+
+    return "\n".join(lines)
+
+
 # =========================
 # Chunk preview images
 # =========================
@@ -1547,6 +1594,7 @@ def process_single_pdf(
     searchable_pdf_dpi: Optional[int] = None,
     bbox_overlay_pdf_path: Optional[str] = None,
     bbox_overlay_pdf_dpi: Optional[int] = None,
+    text_out_path: Optional[str] = None,
 ):
     if year is None:
         year = infer_year_from_filename(pdf_path) or datetime.now().year
@@ -1625,6 +1673,12 @@ def process_single_pdf(
         json.dump(qa, f, ensure_ascii=False, indent=2)
 
     logger.info("Wrote %d QA items to %s", len(qa), out_path)
+
+    if text_out_path:
+        ensure_dir(os.path.dirname(os.path.abspath(text_out_path)))
+        with open(text_out_path, "w", encoding="utf-8") as fh:
+            fh.write(format_qa_items_as_text(qa))
+        logger.info("Wrote QA text export to %s", text_out_path)
 
     if raster_pdf_path:
         dpi = raster_pdf_dpi or (ocr_settings.dpi if ocr_settings else 800)
@@ -1755,6 +1809,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     ap.add_argument(
+        "--text-out",
+        help="Path or directory to save a combined plain-text export of parsed QAs",
+    )
+
+    ap.add_argument(
         "--margin-ui",
         action="store_true",
         help="Launch an interactive preview to pick left/right margins",
@@ -1848,6 +1907,17 @@ def main():
                 bbox_overlay_paths = [args.bbox_overlay_pdf_out]
         else:
             bbox_overlay_paths = [None]
+
+        if args.text_out:
+            if os.path.isdir(args.text_out) or args.text_out.endswith(os.sep):
+                target_dir = args.text_out
+                ensure_dir(target_dir)
+                text_paths = [os.path.join(target_dir, f"{base_pdf}.txt")]
+            else:
+                ensure_dir(os.path.dirname(os.path.abspath(args.text_out)))
+                text_paths = [args.text_out]
+        else:
+            text_paths = [None]
     else:
         pdfs = list_pdfs(args.pdf_dir)
         if not pdfs:
@@ -1899,14 +1969,38 @@ def main():
         else:
             bbox_overlay_paths = [None] * len(pdfs)
 
+        if args.text_out:
+            ensure_dir(args.text_out)
+            text_paths = [
+                os.path.join(
+                    args.text_out,
+                    os.path.splitext(os.path.basename(p))[0] + ".txt",
+                )
+                for p in pdfs
+            ]
+        else:
+            text_paths = [None] * len(pdfs)
+
     ocr_settings = OCRSettings(
         dpi=args.easyocr_dpi,
         languages=[lang.strip() for lang in args.easyocr_langs.split(",") if lang.strip()],
         gpu=args.easyocr_gpu,
     )
 
-    for pdf_path, out_path, raster_path, searchable_path, bbox_overlay_path in zip(
-        pdfs, out_paths, raster_paths, searchable_paths, bbox_overlay_paths
+    for (
+        pdf_path,
+        out_path,
+        raster_path,
+        searchable_path,
+        bbox_overlay_path,
+        text_path,
+    ) in zip(
+        pdfs,
+        out_paths,
+        raster_paths,
+        searchable_paths,
+        bbox_overlay_paths,
+        text_paths,
     ):
         logger.info("Processing %s -> %s", os.path.basename(pdf_path), out_path)
         if raster_path:
@@ -1924,6 +2018,8 @@ def main():
                 "OCR bounding-box overlay will be saved to %s",
                 bbox_overlay_path,
             )
+        if text_path:
+            logger.info("QA text export will be saved to %s", text_path)
         debug_dir = None
         if args.chunk_debug_dir:
             base_debug = os.path.abspath(os.path.expanduser(args.chunk_debug_dir))
@@ -1963,6 +2059,7 @@ def main():
             searchable_pdf_dpi=args.searchable_pdf_dpi,
             bbox_overlay_pdf_path=bbox_overlay_path,
             bbox_overlay_pdf_dpi=args.bbox_overlay_pdf_dpi,
+            text_out_path=text_path,
         )
         logger.info("Completed %s with %d QA items", os.path.basename(pdf_path), len(qa))
 
