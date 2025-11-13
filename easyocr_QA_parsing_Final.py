@@ -695,6 +695,8 @@ def flow_chunk_all_pages(
     clip_mode: str,
     ycut_map: Dict[int, Optional[float]],
     band_map: Dict[int, Optional[Tuple[float, float, float, float]]],
+    *,
+    skip_chunk_detection: bool = False,
 ):
     segs = build_flow_segments(
         pdf,
@@ -738,6 +740,14 @@ def flow_chunk_all_pages(
                 entry = dict(line)
                 entry["column"] = col
                 col_lines.append(entry)
+
+    if skip_chunk_detection:
+        logger.debug(
+            "Skipping automatic chunk detection; returning OCR lines for %d segments.",
+            len(seg_meta),
+        )
+        per_page_boxes = {i: [] for i in range(len(pdf.pages))}
+        return [], per_page_boxes, page_text_map
 
     seg_starts = []
     last_detected_qnum = None
@@ -2005,6 +2015,7 @@ def pdf_to_qa_flow_chunks(
             clip_mode=clip_mode,
             ycut_map=ycut_map,
             band_map=band_map,
+            skip_chunk_detection=manual_only,
         )
         auto_chunk_count = len(chunks)
         manual_region_count = len(manual_questions or [])
