@@ -2778,7 +2778,7 @@ def interactive_chunk_selection(
         ttk.Label(controls, text="Zoom:").grid(row=0, column=0, sticky="w")
         ttk.Scale(
             controls,
-            from_=40,
+            from_=10,
             to=300,
             orient="horizontal",
             variable=zoom_var,
@@ -3109,7 +3109,7 @@ def interactive_margin_selection(
     ttk.Label(controls, text="Zoom:").grid(row=0, column=0, sticky="w")
     zoom_scale = ttk.Scale(
         controls,
-        from_=50,
+        from_=10,
         to=300,
         orient="horizontal",
         variable=zoom_var,
