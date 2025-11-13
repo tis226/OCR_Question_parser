@@ -474,6 +474,7 @@ def build_flow_segments(
     ycut_map: Dict[int, Optional[float]],
     band_map: Dict[int, Optional[Tuple[float, float, float, float]]],
 ):
+    column_order = {"L": 0, "R": 1}
     segs = []
     for i, page in enumerate(pdf.pages):
         logger.debug("Building flow segments for page %d", i + 1)
@@ -488,6 +489,8 @@ def build_flow_segments(
         )
         segs.append((i, "L", L, L_lines))
         segs.append((i, "R", R, R_lines))
+
+    segs.sort(key=lambda entry: (entry[0], column_order.get(entry[1], 99)))
     return segs
 
 
