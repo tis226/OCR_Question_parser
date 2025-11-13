@@ -20,7 +20,7 @@ import threading
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:  # EasyOCR is only needed at runtime; allow import for tooling/tests without it.
     import easyocr  # type: ignore
@@ -256,6 +256,7 @@ class EasyOCRTextExtractor:
         self._image_cache: Dict[int, Image.Image] = {}
         self._scale = settings.dpi / 72.0
         self.page_word_boxes: Dict[int, List[Dict[str, object]]] = {}
+        self.crop_reports: Dict[int, List[Dict[str, Any]]] = {}
         logger.debug(
             "Initialized EasyOCRTextExtractor: dpi=%s languages=%s gpu=%s pads(x=%.1f top=%.1f bottom=%.1f) filters(top=%.1f bottom=%.1f)",
             settings.dpi,
@@ -279,6 +280,45 @@ class EasyOCRTextExtractor:
             self._image_cache[page_index] = pil
         return self._image_cache[page_index]
 
+    def _record_crop_sample(
+        self,
+        page_index: int,
+        column_tag: Optional[str],
+        orig_bbox: Tuple[float, float, float, float],
+        padded_bbox: Tuple[float, float, float, float],
+        filter_top: float,
+        filter_bottom: float,
+        pad_x: float,
+        pad_top: float,
+        pad_bottom: float,
+        y_cut: Optional[float],
+        drop_zone: Optional[Tuple[float, float, float, float]],
+        raw_word_count: int,
+        kept_word_count: int,
+        line_count: int,
+    ) -> None:
+        drop_tuple: Optional[Tuple[float, float, float, float]] = None
+        if drop_zone is not None:
+            drop_tuple = tuple(float(v) for v in drop_zone)
+        entry: Dict[str, Any] = {
+            "column": column_tag or "?",
+            "orig_bbox": tuple(float(v) for v in orig_bbox),
+            "padded_bbox": tuple(float(v) for v in padded_bbox),
+            "filter_band": (float(filter_top), float(filter_bottom)),
+            "pad": {
+                "x": float(pad_x),
+                "top": float(pad_top),
+                "bottom": float(pad_bottom),
+            },
+            "y_cut": float(y_cut) if y_cut is not None else None,
+            "drop_zone": drop_tuple,
+            "raw_word_count": int(raw_word_count),
+            "kept_word_count": int(kept_word_count),
+            "line_count": int(line_count),
+        }
+        bucket = self.crop_reports.setdefault(page_index, [])
+        bucket.append(entry)
+
     def extract_lines(
         self,
         page_index: int,
@@ -301,6 +341,7 @@ class EasyOCRTextExtractor:
         pad_top = max(0.0, float(getattr(self.settings, "column_pad_top", 0.0)))
         pad_bottom = max(0.0, float(getattr(self.settings, "column_pad_bottom", 0.0)))
         orig_bbox = (x0, y0, x1, y1)
+        padded_bbox = (x0, y0, x1, y1)
         if pad_x or pad_top or pad_bottom:
             padded_bbox = (
                 max(0.0, x0 - pad_x),
@@ -342,6 +383,22 @@ class EasyOCRTextExtractor:
             int(round(y1 * scale)),
         )
         if crop_box[2] - crop_box[0] <= 0 or crop_box[3] - crop_box[1] <= 0:
+            self._record_crop_sample(
+                page_index,
+                column_tag,
+                orig_bbox,
+                padded_bbox,
+                filter_top,
+                filter_bottom,
+                pad_x,
+                pad_top,
+                pad_bottom,
+                y_cut,
+                drop_zone,
+                raw_word_count=0,
+                kept_word_count=0,
+                line_count=0,
+            )
             return []
 
         crop = im.crop(crop_box)
@@ -409,9 +466,6 @@ class EasyOCRTextExtractor:
             bucket = self.page_word_boxes.setdefault(page_index, [])
             bucket.extend(word_entries)
 
-        if not entries:
-            return []
-
         entries.sort(key=lambda r: (r["top"], r["x0"]))
         grouped: List[List[Dict[str, float]]] = []
         cur: List[Dict[str, float]] = []
@@ -447,6 +501,22 @@ class EasyOCRTextExtractor:
             )
 
         lines.sort(key=lambda ln: (ln["top"], ln["x0"]))
+        self._record_crop_sample(
+            page_index,
+            column_tag,
+            orig_bbox,
+            padded_bbox,
+            filter_top,
+            filter_bottom,
+            pad_x,
+            pad_top,
+            pad_bottom,
+            y_cut,
+            drop_zone,
+            raw_word_count=len(results),
+            kept_word_count=len(word_entries),
+            line_count=len(lines),
+        )
         logger.debug(
             "Page %d OCR produced %d text lines in column window",
             page_index + 1,
@@ -1274,6 +1344,73 @@ def save_bbox_overlay_pdf(
                 pass
 
 
+def save_crop_report(
+    pdf_path: str,
+    out_path: str,
+    crop_report: Dict[int, List[Dict[str, Any]]],
+) -> None:
+    abs_out = os.path.abspath(os.path.expanduser(out_path))
+    ensure_dir(os.path.dirname(abs_out))
+
+    def fmt_bbox(bbox: Sequence[float]) -> str:
+        return "(%.2f, %.2f, %.2f, %.2f)" % tuple(float(v) for v in bbox)
+
+    def fmt_band(band: Sequence[float]) -> str:
+        return "(%.2f – %.2f)" % (float(band[0]), float(band[1]))
+
+    lines: List[str] = []
+    lines.append(f"Crop report for {os.path.basename(pdf_path)}")
+    lines.append(f"Generated {datetime.now().isoformat(timespec='seconds')}")
+    lines.append("")
+
+    for page_index in sorted(crop_report.keys()):
+        entries = crop_report.get(page_index) or []
+        lines.append(f"Page {page_index + 1}")
+        if not entries:
+            lines.append("  (no OCR segments)")
+            lines.append("")
+            continue
+        ordered = sorted(
+            entries,
+            key=lambda e: (
+                0 if str(e.get("column", "")).upper() == "L" else 1,
+                (e.get("orig_bbox") or (0.0, 0.0, 0.0, 0.0))[1],
+            ),
+        )
+        for entry in ordered:
+            col = str(entry.get("column") or "?").upper()
+            orig = entry.get("orig_bbox") or (0.0, 0.0, 0.0, 0.0)
+            padded = entry.get("padded_bbox") or orig
+            band = entry.get("filter_band") or (0.0, 0.0)
+            pad = entry.get("pad") or {}
+            drop = entry.get("drop_zone")
+            lines.append(f"  Column {col}:")
+            lines.append(f"    original bbox : {fmt_bbox(orig)}")
+            lines.append(f"    padded bbox   : {fmt_bbox(padded)}")
+            lines.append(f"    filter band   : {fmt_band(band)}")
+            lines.append(
+                "    padding       : x=%s top=%s bottom=%s"
+                % (
+                    f"{float(pad.get('x', 0.0)):.2f}",
+                    f"{float(pad.get('top', 0.0)):.2f}",
+                    f"{float(pad.get('bottom', 0.0)):.2f}",
+                )
+            )
+            if entry.get("y_cut") is not None:
+                lines.append(f"    y-cut         : {float(entry['y_cut']):.2f}")
+            if drop:
+                lines.append(f"    drop zone     : {fmt_bbox(drop)}")
+            lines.append(
+                "    OCR words     : kept %d / raw %d"
+                % (int(entry.get("kept_word_count", 0)), int(entry.get("raw_word_count", 0)))
+            )
+            lines.append(f"    line count    : {int(entry.get('line_count', 0))}")
+        lines.append("")
+
+    with open(abs_out, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines).rstrip() + "\n")
+
+
 # =========================
 # Top-level parse
 # =========================
@@ -1434,8 +1571,12 @@ def pdf_to_qa_flow_chunks(
             idx: extractor.page_word_boxes.get(idx, [])
             for idx in range(len(pdf.pages))
         }
+        crop_report_map: Dict[int, List[Dict[str, Any]]] = {
+            idx: extractor.crop_reports.get(idx, [])
+            for idx in range(len(pdf.pages))
+        }
 
-    return out, page_text_map, page_word_map
+    return out, page_text_map, page_word_map, crop_report_map
 
 
 # =========================
@@ -1842,6 +1983,7 @@ def process_single_pdf(
     bbox_overlay_pdf_path: Optional[str] = None,
     bbox_overlay_pdf_dpi: Optional[int] = None,
     text_out_path: Optional[str] = None,
+    crop_report_path: Optional[str] = None,
     expected_question_count: Optional[int] = None,
     fail_on_incomplete: bool = False,
 ):
@@ -1894,8 +2036,9 @@ def process_single_pdf(
     )
     heartbeat.start()
 
+    crop_report_map: Dict[int, List[Dict[str, Any]]] = {}
     try:
-        qa, page_text_map, page_word_map = pdf_to_qa_flow_chunks(
+        qa, page_text_map, page_word_map, crop_report_map = pdf_to_qa_flow_chunks(
             pdf_path=pdf_path,
             year=year,
             start_num=start_num,
@@ -1928,6 +2071,10 @@ def process_single_pdf(
         with open(text_out_path, "w", encoding="utf-8") as fh:
             fh.write(format_qa_items_as_text(qa))
         logger.info("Wrote QA text export to %s", text_out_path)
+
+    if crop_report_path:
+        save_crop_report(pdf_path, crop_report_path, crop_report_map)
+        logger.info("Wrote column crop report to %s", crop_report_path)
 
     if raster_pdf_path:
         dpi = raster_pdf_dpi or (ocr_settings.dpi if ocr_settings else 800)
@@ -2107,6 +2254,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     ap.add_argument(
+        "--crop-report-out",
+        help="Path or directory to save a text report describing each column crop",
+    )
+
+    ap.add_argument(
         "--expected-question-count",
         type=int,
         help="Expected number of QA items; used for validation reporting",
@@ -2224,6 +2376,19 @@ def main():
                 text_paths = [args.text_out]
         else:
             text_paths = [None]
+
+        if args.crop_report_out:
+            if os.path.isdir(args.crop_report_out) or args.crop_report_out.endswith(os.sep):
+                target_dir = args.crop_report_out
+                ensure_dir(target_dir)
+                crop_report_paths = [
+                    os.path.join(target_dir, f"{base_pdf}_crop_report.txt")
+                ]
+            else:
+                ensure_dir(os.path.dirname(os.path.abspath(args.crop_report_out)))
+                crop_report_paths = [args.crop_report_out]
+        else:
+            crop_report_paths = [None]
     else:
         pdfs = list_pdfs(args.pdf_dir)
         if not pdfs:
@@ -2287,6 +2452,19 @@ def main():
         else:
             text_paths = [None] * len(pdfs)
 
+        if args.crop_report_out:
+            ensure_dir(args.crop_report_out)
+            crop_report_paths = [
+                os.path.join(
+                    args.crop_report_out,
+                    os.path.splitext(os.path.basename(p))[0]
+                    + "_crop_report.txt",
+                )
+                for p in pdfs
+            ]
+        else:
+            crop_report_paths = [None] * len(pdfs)
+
     ocr_settings = OCRSettings(
         dpi=args.easyocr_dpi,
         languages=[lang.strip() for lang in args.easyocr_langs.split(",") if lang.strip()],
@@ -2305,6 +2483,7 @@ def main():
         searchable_path,
         bbox_overlay_path,
         text_path,
+        crop_report_path,
     ) in zip(
         pdfs,
         out_paths,
@@ -2312,6 +2491,7 @@ def main():
         searchable_paths,
         bbox_overlay_paths,
         text_paths,
+        crop_report_paths,
     ):
         logger.info("Processing %s -> %s", os.path.basename(pdf_path), out_path)
         if raster_path:
@@ -2331,6 +2511,10 @@ def main():
             )
         if text_path:
             logger.info("QA text export will be saved to %s", text_path)
+        if crop_report_path:
+            logger.info(
+                "Column crop report will be saved to %s", crop_report_path
+            )
         debug_dir = None
         if args.chunk_debug_dir:
             base_debug = os.path.abspath(os.path.expanduser(args.chunk_debug_dir))
@@ -2373,6 +2557,7 @@ def main():
                 bbox_overlay_pdf_path=bbox_overlay_path,
                 bbox_overlay_pdf_dpi=args.bbox_overlay_pdf_dpi,
                 text_out_path=text_path,
+                crop_report_path=crop_report_path,
                 expected_question_count=args.expected_question_count,
                 fail_on_incomplete=args.fail_on_incomplete,
             )
