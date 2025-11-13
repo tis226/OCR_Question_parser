@@ -476,6 +476,9 @@ def flow_chunk_all_pages(
     logger.debug("Built %d column segments", len(segs))
 
     seg_meta = []
+    page_text_map: Dict[int, List[Dict[str, object]]] = {
+        i: [] for i in range(len(pdf.pages))
+    }
     for (pi, col, bbox, lines) in segs:
         L, R = two_col_bboxes(pdf.pages[pi], top_frac, bottom_frac, gutter_frac)
         if col == "L":
@@ -495,6 +498,12 @@ def flow_chunk_all_pages(
                 None if rel_offset is None else round(rel_offset, 2),
             )
         seg_meta.append((pi, col, bbox, lines, margin_abs, col_left))
+        if lines:
+            col_lines = page_text_map.setdefault(pi, [])
+            for line in lines:
+                entry = dict(line)
+                entry["column"] = col
+                col_lines.append(entry)
 
     seg_starts = []
     last_detected_qnum = None
@@ -558,7 +567,7 @@ def flow_chunk_all_pages(
             b["col"] = p["col"]
             per_page_boxes[p["page"]].append(b)
 
-    return chunks, per_page_boxes
+    return chunks, per_page_boxes, page_text_map
 
 
 # =========================
@@ -718,6 +727,79 @@ def save_rasterized_pdf(pdf_path: str, out_path: str, dpi: int) -> None:
                 pass
 
 
+def save_searchable_pdf(
+    pdf_path: str,
+    out_path: str,
+    dpi: int,
+    page_text_map: Dict[int, List[Dict[str, object]]],
+) -> None:
+    try:
+        from reportlab.lib.utils import ImageReader
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+        from reportlab.pdfgen import canvas
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "Saving searchable PDFs requires the reportlab package"
+        ) from exc
+
+    abs_out = os.path.abspath(os.path.expanduser(out_path))
+    ensure_dir(os.path.dirname(abs_out))
+
+    font_name = "HYGoThic-Medium"
+    try:
+        pdfmetrics.getFont(font_name)
+    except KeyError:
+        pdfmetrics.registerFont(UnicodeCIDFont(font_name))
+
+    with pdfplumber.open(pdf_path) as pdf:
+        canv = canvas.Canvas(abs_out)
+        for page_index, page in enumerate(pdf.pages):
+            width, height = float(page.width), float(page.height)
+            canv.setPageSize((width, height))
+            pil = page.to_image(resolution=int(dpi)).original.convert("RGB")
+            try:
+                canv.drawImage(
+                    ImageReader(pil),
+                    0,
+                    0,
+                    width=width,
+                    height=height,
+                    mask=None,
+                )
+            finally:
+                pil.close()
+
+            lines = page_text_map.get(page_index) or []
+            lines_sorted = sorted(lines, key=lambda ln: (ln.get("top", 0.0), ln.get("x0", 0.0)))
+            for ln in lines_sorted:
+                raw_text = ln.get("text")
+                if not raw_text:
+                    continue
+                text = norm_space(str(raw_text))
+                if not text:
+                    continue
+                try:
+                    x0 = float(ln.get("x0", 0.0))
+                    top = float(ln.get("top", 0.0))
+                    bottom = float(ln.get("bottom", top))
+                except (TypeError, ValueError):
+                    continue
+                line_height = max(bottom - top, 6.0)
+                font_size = min(max(line_height * 0.95, 6.0), 36.0)
+                baseline = height - top - (line_height * 0.2)
+                text_obj = canv.beginText()
+                text_obj.setTextRenderMode(3)  # invisible but searchable text layer
+                text_obj.setFont(font_name, font_size)
+                text_obj.setTextOrigin(x0, baseline)
+                text_obj.textLine(text)
+                canv.drawText(text_obj)
+
+            canv.showPage()
+
+        canv.save()
+
+
 # =========================
 # Top-level parse
 # =========================
@@ -760,6 +842,8 @@ def pdf_to_qa_flow_chunks(
     if debug_dir:
         ensure_dir(debug_dir)
 
+    page_text_map: Dict[int, List[Dict[str, object]]] = {}
+
     with pdfplumber.open(pdf_path) as pdf:
         logger.info(
             "Opened %s with %d pages (year=%s, start=%s)",
@@ -772,7 +856,7 @@ def pdf_to_qa_flow_chunks(
         ycut_map: Dict[int, Optional[float]] = {}
         band_map: Dict[int, Optional[Tuple[float, float, float, float]]] = {}
 
-        chunks, _ = flow_chunk_all_pages(
+        chunks, _, page_text_map = flow_chunk_all_pages(
             pdf,
             extractor,
             L_rel,
@@ -872,7 +956,7 @@ def pdf_to_qa_flow_chunks(
 
         logger.info("Accepted %d QA items after filtering", len(out))
 
-    return out
+    return out, page_text_map
 
 
 # =========================
@@ -1273,6 +1357,8 @@ def process_single_pdf(
     failed_chunk_log_chars: int = 240,
     raster_pdf_path: Optional[str] = None,
     raster_pdf_dpi: Optional[int] = None,
+    searchable_pdf_path: Optional[str] = None,
+    searchable_pdf_dpi: Optional[int] = None,
 ):
     if year is None:
         year = infer_year_from_filename(pdf_path) or datetime.now().year
@@ -1324,7 +1410,7 @@ def process_single_pdf(
     heartbeat.start()
 
     try:
-        qa = pdf_to_qa_flow_chunks(
+        qa, page_text_map = pdf_to_qa_flow_chunks(
             pdf_path=pdf_path,
             year=year,
             start_num=start_num,
@@ -1356,6 +1442,15 @@ def process_single_pdf(
         dpi = raster_pdf_dpi or (ocr_settings.dpi if ocr_settings else 800)
         save_rasterized_pdf(pdf_path, raster_pdf_path, dpi)
         logger.info("Saved rasterized PDF preview to %s", raster_pdf_path)
+    if searchable_pdf_path:
+        dpi = searchable_pdf_dpi or (ocr_settings.dpi if ocr_settings else 800)
+        save_searchable_pdf(
+            pdf_path,
+            searchable_pdf_path,
+            dpi,
+            page_text_map,
+        )
+        logger.info("Saved searchable OCR PDF to %s", searchable_pdf_path)
     return qa
 
 
@@ -1443,6 +1538,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     ap.add_argument(
+        "--searchable-pdf-out",
+        help="Path or directory to save a searchable OCR PDF for each input",
+    )
+    ap.add_argument(
+        "--searchable-pdf-dpi",
+        type=int,
+        help="DPI to use when rasterizing pages for the searchable PDF layer",
+    )
+
+    ap.add_argument(
         "--margin-ui",
         action="store_true",
         help="Launch an interactive preview to pick left/right margins",
@@ -1506,6 +1611,22 @@ def main():
                 raster_paths = [args.raster_pdf_out]
         else:
             raster_paths = [None]
+
+        if args.searchable_pdf_out:
+            base_pdf = os.path.splitext(os.path.basename(args.pdf))[0]
+            if os.path.isdir(args.searchable_pdf_out) or args.searchable_pdf_out.endswith(os.sep):
+                target_dir = args.searchable_pdf_out
+                ensure_dir(target_dir)
+                searchable_paths = [
+                    os.path.join(target_dir, f"{base_pdf}_searchable.pdf")
+                ]
+            else:
+                ensure_dir(
+                    os.path.dirname(os.path.abspath(args.searchable_pdf_out))
+                )
+                searchable_paths = [args.searchable_pdf_out]
+        else:
+            searchable_paths = [None]
     else:
         pdfs = list_pdfs(args.pdf_dir)
         if not pdfs:
@@ -1533,18 +1654,37 @@ def main():
         else:
             raster_paths = [None] * len(pdfs)
 
+        if args.searchable_pdf_out:
+            ensure_dir(args.searchable_pdf_out)
+            searchable_paths = [
+                os.path.join(
+                    args.searchable_pdf_out,
+                    os.path.splitext(os.path.basename(p))[0] + "_searchable.pdf",
+                )
+                for p in pdfs
+            ]
+        else:
+            searchable_paths = [None] * len(pdfs)
+
     ocr_settings = OCRSettings(
         dpi=args.easyocr_dpi,
         languages=[lang.strip() for lang in args.easyocr_langs.split(",") if lang.strip()],
         gpu=args.easyocr_gpu,
     )
 
-    for pdf_path, out_path, raster_path in zip(pdfs, out_paths, raster_paths):
+    for pdf_path, out_path, raster_path, searchable_path in zip(
+        pdfs, out_paths, raster_paths, searchable_paths
+    ):
         logger.info("Processing %s -> %s", os.path.basename(pdf_path), out_path)
         if raster_path:
             logger.info(
                 "Rasterized PDF output will be saved to %s",
                 raster_path,
+            )
+        if searchable_path:
+            logger.info(
+                "Searchable OCR PDF will be saved to %s",
+                searchable_path,
             )
         debug_dir = None
         if args.chunk_debug_dir:
@@ -1581,6 +1721,8 @@ def main():
             failed_chunk_log_chars=args.failed_chunk_log_chars,
             raster_pdf_path=raster_path,
             raster_pdf_dpi=args.raster_pdf_dpi,
+            searchable_pdf_path=searchable_path,
+            searchable_pdf_dpi=args.searchable_pdf_dpi,
         )
         logger.info("Completed %s with %d QA items", os.path.basename(pdf_path), len(qa))
 
