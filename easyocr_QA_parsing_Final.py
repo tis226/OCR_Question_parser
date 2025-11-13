@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import sys
+import threading
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime
@@ -24,6 +26,9 @@ import easyocr
 import numpy as np
 import pdfplumber
 from PIL import Image
+
+
+logger = logging.getLogger(__name__)
 
 # =========================
 # Helpers
@@ -62,6 +67,55 @@ def _normalize_visible_text(s: str) -> str:
         .replace("•", "·")
     )
     return s
+
+
+# =========================
+# Logging helpers
+# =========================
+
+
+def _parse_log_level(value: str) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    try:
+        level = getattr(logging, value.upper())
+    except AttributeError as exc:
+        raise argparse.ArgumentTypeError(f"Unknown log level: {value}") from exc
+    if not isinstance(level, int):
+        raise argparse.ArgumentTypeError(f"Unknown log level: {value}")
+    return level
+
+
+class HeartbeatLogger:
+    """Periodically emit log messages while work is ongoing."""
+
+    def __init__(self, interval: float = 30.0, message: str = "Working..."):
+        self.interval = max(1.0, float(interval))
+        self.message = message
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self):
+        if self._thread is not None:
+            return
+        logger.debug("Starting heartbeat logger every %.1f seconds", self.interval)
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop_event.wait(self.interval):
+            logger.info(self.message)
+
+    def stop(self):
+        if self._thread is None:
+            return
+        logger.debug("Stopping heartbeat logger")
+        self._stop_event.set()
+        self._thread.join()
+        self._thread = None
 
 
 # =========================
@@ -137,9 +191,16 @@ class EasyOCRTextExtractor:
         self.reader = easyocr.Reader(list(settings.languages), gpu=settings.gpu)
         self._image_cache: Dict[int, Image.Image] = {}
         self._scale = settings.dpi / 72.0
+        logger.debug(
+            "Initialized EasyOCRTextExtractor: dpi=%s languages=%s gpu=%s",
+            settings.dpi,
+            ",".join(settings.languages),
+            settings.gpu,
+        )
 
     def _page_image(self, page_index: int) -> Image.Image:
         if page_index not in self._image_cache:
+            logger.debug("Rendering page %d at %d DPI", page_index + 1, self.settings.dpi)
             pil = (
                 self.pdf.pages[page_index]
                 .to_image(resolution=int(self.settings.dpi))
@@ -164,6 +225,15 @@ class EasyOCRTextExtractor:
 
         scale = self._scale
         im = self._page_image(page_index)
+        logger.debug(
+            "Extracting lines from page %d bbox=(%.1f, %.1f, %.1f, %.1f) scale=%.3f",
+            page_index + 1,
+            x0,
+            y0,
+            x1,
+            y1,
+            scale,
+        )
         crop_box = (
             int(round(x0 * scale)),
             int(round(y0 * scale)),
@@ -241,6 +311,11 @@ class EasyOCRTextExtractor:
             )
 
         lines.sort(key=lambda ln: (ln["top"], ln["x0"]))
+        logger.debug(
+            "Page %d OCR produced %d text lines in column window",
+            page_index + 1,
+            len(lines),
+        )
         return lines
 
 
@@ -334,6 +409,7 @@ def build_flow_segments(
 ):
     segs = []
     for i, page in enumerate(pdf.pages):
+        logger.debug("Building flow segments for page %d", i + 1)
         L, R = two_col_bboxes(page, top_frac, bottom_frac, gutter_frac)
         ycut = ycut_map.get(i + 1) if clip_mode == "ycut" else None
         band = band_map.get(i + 1) if clip_mode == "band" else None
@@ -369,6 +445,7 @@ def flow_chunk_all_pages(
         ycut_map,
         band_map,
     )
+    logger.debug("Built %d column segments", len(segs))
 
     seg_meta = []
     for (pi, col, bbox, lines) in segs:
@@ -388,6 +465,12 @@ def flow_chunk_all_pages(
             lines, m_abs, col_left, tol=tol, last_qnum=last_detected_qnum
         )
         seg_starts.append(starts)
+        logger.debug(
+            "Detected %d candidate question starts on page %d column %s",
+            len(starts),
+            pi + 1,
+            col,
+        )
 
     chunks = []
     current = None
@@ -427,6 +510,7 @@ def flow_chunk_all_pages(
                 i += 1
     if current is not None:
         chunks.append(current)
+    logger.debug("Assembled %d candidate chunks", len(chunks))
 
     per_page_boxes = {i: [] for i in range(len(pdf.pages))}
     for ch_id, ch in enumerate(chunks, start=1):
@@ -586,6 +670,13 @@ def pdf_to_qa_flow_chunks(
     )
 
     with pdfplumber.open(pdf_path) as pdf:
+        logger.info(
+            "Opened %s with %d pages (year=%s, start=%s)",
+            os.path.basename(pdf_path),
+            len(pdf.pages),
+            year,
+            start_num,
+        )
         extractor = EasyOCRTextExtractor(pdf, ocr_settings)
         ycut_map: Dict[int, Optional[float]] = {}
         band_map: Dict[int, Optional[Tuple[float, float, float, float]]] = {}
@@ -604,6 +695,7 @@ def pdf_to_qa_flow_chunks(
             ycut_map=ycut_map,
             band_map=band_map,
         )
+        logger.info("Detected %d raw chunks before QA filtering", len(chunks))
 
         for ch in chunks:
             pieces = ch.get("pieces") or []
@@ -620,6 +712,11 @@ def pdf_to_qa_flow_chunks(
                 extract_qa_from_chunk_text(text)
             )
             if stem is None or not options:
+                logger.debug(
+                    "Skipping chunk starting on page %d column %s: no QA detected",
+                    pieces[0]["page"] + 1,
+                    pieces[0]["col"],
+                )
                 continue
 
             if detected_qnum is not None:
@@ -663,6 +760,14 @@ def pdf_to_qa_flow_chunks(
             )
 
             last_assigned_qno = qno
+            logger.debug(
+                "Accepted chunk %d => question %d (%d options)",
+                global_idx,
+                qno,
+                len(options),
+            )
+
+        logger.info("Accepted %d QA items after filtering", len(out))
 
     return out
 
@@ -974,6 +1079,7 @@ def process_single_pdf(
     margin_ui: bool = False,
     margin_ui_page: int = 1,
     margin_ui_dpi: int = 200,
+    heartbeat_interval: float = 30.0,
 ):
     if year is None:
         year = infer_year_from_filename(pdf_path) or datetime.now().year
@@ -990,38 +1096,66 @@ def process_single_pdf(
                 initial_left=margin_left,
                 initial_right=margin_right,
             )
+            logger.info(
+                "Interactive margins selected: L=%.2f R=%.2f",
+                margin_left,
+                margin_right,
+            )
         except RuntimeError as exc:
-            print(f"[ERROR] Margin selector failed: {exc}", file=sys.stderr)
+            logger.exception("Margin selector failed: %s", exc)
             sys.exit(3)
     elif margin_left is None or margin_right is None:
         auto_l, auto_r = _auto_detect_margins_for_pdf(
             pdf_path, top_frac, bottom_frac, gutter_frac
         )
+        logger.debug(
+            "Auto-detected margins for %s: L=%s R=%s",
+            os.path.basename(pdf_path),
+            "None" if auto_l is None else f"{auto_l:.2f}",
+            "None" if auto_r is None else f"{auto_r:.2f}",
+        )
         margin_left = margin_left if margin_left is not None else auto_l
         margin_right = margin_right if margin_right is not None else auto_r
 
-    qa = pdf_to_qa_flow_chunks(
-        pdf_path=pdf_path,
-        year=year,
-        start_num=start_num,
-        L_rel=margin_left,
-        R_rel=margin_right,
-        tol=tol,
-        top_frac=top_frac,
-        bottom_frac=bottom_frac,
-        gutter_frac=gutter_frac,
-        y_tol=3.0,
-        clip_mode=clip_mode,
-        chunk_preview_dir=preview_dir,
-        chunk_preview_dpi=preview_dpi,
-        chunk_preview_pad=preview_pad,
-        ocr_settings=ocr_settings,
+    logger.info(
+        "Processing %s with margins L=%s R=%s",
+        os.path.basename(pdf_path),
+        "auto" if margin_left is None else f"{margin_left:.2f}",
+        "auto" if margin_right is None else f"{margin_right:.2f}",
     )
+
+    heartbeat = HeartbeatLogger(
+        interval=heartbeat_interval,
+        message=f"Still processing {os.path.basename(pdf_path)}...",
+    )
+    heartbeat.start()
+
+    try:
+        qa = pdf_to_qa_flow_chunks(
+            pdf_path=pdf_path,
+            year=year,
+            start_num=start_num,
+            L_rel=margin_left,
+            R_rel=margin_right,
+            tol=tol,
+            top_frac=top_frac,
+            bottom_frac=bottom_frac,
+            gutter_frac=gutter_frac,
+            y_tol=3.0,
+            clip_mode=clip_mode,
+            chunk_preview_dir=preview_dir,
+            chunk_preview_dpi=preview_dpi,
+            chunk_preview_pad=preview_pad,
+            ocr_settings=ocr_settings,
+        )
+    finally:
+        heartbeat.stop()
 
     ensure_dir(os.path.dirname(os.path.abspath(out_path)))
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(qa, f, ensure_ascii=False, indent=2)
 
+    logger.info("Wrote %d QA items to %s", len(qa), out_path)
     return qa
 
 
@@ -1091,12 +1225,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Rendering DPI for the margin preview window",
     )
 
+    ap.add_argument(
+        "--log-level",
+        default=_parse_log_level("INFO"),
+        type=_parse_log_level,
+        help="Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)",
+    )
+    ap.add_argument(
+        "--heartbeat-secs",
+        type=float,
+        default=30.0,
+        help="Seconds between progress heartbeat log messages",
+    )
+
     return ap
 
 
 def main():
     ap = build_arg_parser()
     args = ap.parse_args()
+
+    logging.basicConfig(
+        level=args.log_level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+    logger.info(
+        "Log level set to %s",
+        logging.getLevelName(args.log_level),
+    )
 
     if args.pdf:
         pdfs = [args.pdf]
@@ -1105,12 +1261,12 @@ def main():
     else:
         pdfs = list_pdfs(args.pdf_dir)
         if not pdfs:
-            print(f"[ERROR] No PDFs found in {args.pdf_dir}", file=sys.stderr)
+            logger.error("No PDFs found in %s", args.pdf_dir)
             sys.exit(2)
         ensure_dir(args.out)
         out_paths = [os.path.join(args.out, os.path.splitext(os.path.basename(p))[0] + ".json") for p in pdfs]
         batch_mode = True
-        print(f"[INFO] Processing {len(pdfs)} PDFs from {args.pdf_dir}")
+        logger.info("Processing %d PDFs from %s", len(pdfs), args.pdf_dir)
 
     ocr_settings = OCRSettings(
         dpi=args.easyocr_dpi,
@@ -1119,7 +1275,7 @@ def main():
     )
 
     for pdf_path, out_path in zip(pdfs, out_paths):
-        print(f"[INFO] Processing {os.path.basename(pdf_path)} -> {out_path}")
+        logger.info("Processing %s -> %s", os.path.basename(pdf_path), out_path)
         qa = process_single_pdf(
             pdf_path=pdf_path,
             out_path=out_path,
@@ -1139,11 +1295,12 @@ def main():
             margin_ui=args.margin_ui,
             margin_ui_page=args.margin_ui_page,
             margin_ui_dpi=args.margin_ui_dpi,
+            heartbeat_interval=args.heartbeat_secs,
         )
-        print(f"[INFO]   -> extracted {len(qa)} QA items")
+        logger.info("Completed %s with %d QA items", os.path.basename(pdf_path), len(qa))
 
     if batch_mode:
-        print("[INFO] Batch finished")
+        logger.info("Batch finished")
 
 
 if __name__ == "__main__":
