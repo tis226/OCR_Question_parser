@@ -2116,29 +2116,29 @@ def interactive_chunk_selection(
         if page_count == 0:
             raise RuntimeError("The PDF has no pages to annotate")
 
-            state: Dict[str, Any] = {
-                "zoom": 1.0,
-                "page_index": 0,
-                "base_img": None,
-                "base_w": None,
-                "base_h": None,
-                "scale_x": 1.0,
-                "scale_y": 1.0,
-                "L_bbox": None,
-                "R_bbox": None,
-                "questions": {},
-                "selected_qid": None,
-                "next_qid": 1,
-                "drag_start": None,
-                "drag_rect_id": None,
-                "draw_mode": ("question", None),
-                "shift_active": False,
-                "active_option_digit": None,
-                "result": None,
-            }
-    
-            root = tk.Tk()
-            root.title("Manual QA Chunk Selector")
+        state: Dict[str, Any] = {
+            "zoom": 1.0,
+            "page_index": 0,
+            "base_img": None,
+            "base_w": None,
+            "base_h": None,
+            "scale_x": 1.0,
+            "scale_y": 1.0,
+            "L_bbox": None,
+            "R_bbox": None,
+            "questions": {},
+            "selected_qid": None,
+            "next_qid": 1,
+            "drag_start": None,
+            "drag_rect_id": None,
+            "draw_mode": ("question", None),
+            "shift_active": False,
+            "active_option_digit": None,
+            "result": None,
+        }
+
+        root = tk.Tk()
+        root.title("Manual QA Chunk Selector")
     
         main_frame = ttk.Frame(root, padding=8)
         main_frame.grid(row=0, column=0, sticky="nsew")
