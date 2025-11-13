@@ -30,7 +30,7 @@ except Exception:  # pragma: no cover - handled lazily when constructing the rea
     easyocr = None  # type: ignore[assignment]
 import numpy as np
 import pdfplumber
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 
 logger = logging.getLogger(__name__)
@@ -1726,9 +1726,18 @@ def save_bbox_overlay_pdf(
     line_map: Optional[Dict[int, List[Dict[str, object]]]] = None,
     word_color: Tuple[int, int, int] = (255, 0, 0),
     line_color: Tuple[int, int, int] = (0, 128, 255),
+    question_box_map: Optional[Dict[int, List[Dict[str, Any]]]] = None,
+    question_box_color: Tuple[int, int, int] = (0, 255, 0),
 ) -> None:
     abs_out = os.path.abspath(os.path.expanduser(out_path))
     ensure_dir(os.path.dirname(abs_out))
+
+    def measure_text(draw_obj: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> Tuple[int, int]:
+        if hasattr(draw_obj, "textbbox"):
+            bbox = draw_obj.textbbox((0, 0), text, font=font)
+            return int(bbox[2] - bbox[0]), int(bbox[3] - bbox[1])
+        width, height = draw_obj.textsize(text, font=font)
+        return int(width), int(height)
 
     images: List[Image.Image] = []
     try:
@@ -1746,6 +1755,7 @@ def save_bbox_overlay_pdf(
                 draw = ImageDraw.Draw(base_img)
                 stroke_words = max(1, int(round(dpi / 300)))
                 stroke_lines = max(1, int(round(dpi / 360)))
+                stroke_questions = max(1, int(round(dpi / 320)))
 
                 words = word_map.get(page_index) or []
                 for word in words:
@@ -1769,6 +1779,62 @@ def save_bbox_overlay_pdf(
                         except (TypeError, ValueError):
                             continue
                         draw.rectangle((x0, top, x1, bottom), outline=line_color, width=stroke_lines)
+
+                question_entries = []
+                if question_box_map:
+                    question_entries = question_box_map.get(page_index) or []
+                if question_entries:
+                    font_size = max(12, int(round(dpi / 18)))
+                    label_font: ImageFont.ImageFont
+                    try:
+                        label_font = ImageFont.truetype("DejaVuSans-Bold.ttf", font_size)
+                    except Exception:
+                        try:
+                            label_font = ImageFont.truetype("Arial.ttf", font_size)
+                        except Exception:
+                            label_font = ImageFont.load_default()
+                    label_pad = max(2, int(round(dpi / 220)))
+                    def entry_sort_key(entry: Dict[str, Any]):
+                        qn = entry.get("question_number")
+                        try:
+                            primary = int(qn)
+                            flag = 0
+                        except (TypeError, ValueError):
+                            primary = str(qn or "")
+                            flag = 1
+                        box = entry.get("box") or (0.0, 0.0, 0.0, 0.0)
+                        return (flag, primary, box[1])
+                    for entry in sorted(
+                        question_entries,
+                        key=entry_sort_key,
+                    ):
+                        box = entry.get("box")
+                        if not box or len(box) != 4:
+                            continue
+                        try:
+                            x0 = float(box[0]) * scale
+                            top = float(box[1]) * scale
+                            x1 = float(box[2]) * scale
+                            bottom = float(box[3]) * scale
+                        except (TypeError, ValueError):
+                            continue
+                        draw.rectangle(
+                            (x0, top, x1, bottom),
+                            outline=question_box_color,
+                            width=stroke_questions,
+                        )
+                        label = str(entry.get("question_number") or "?")
+                        text_w, text_h = measure_text(draw, label, label_font)
+                        tx = x0 + label_pad
+                        ty = top + label_pad
+                        bg_rect = (
+                            tx - label_pad,
+                            ty - label_pad,
+                            tx + text_w + label_pad,
+                            ty + text_h + label_pad,
+                        )
+                        draw.rectangle(bg_rect, fill=(0, 0, 0))
+                        draw.text((tx, ty), label, fill=(255, 255, 255), font=label_font)
 
                 del draw
                 images.append(base_img)
@@ -2189,6 +2255,51 @@ def interactive_chunk_selection(
             max_id = max(used) if used else 0
             state["next_qid"] = max(max_id + 1, state.get("next_qid", 1))
 
+        def find_question_by_number(number: int) -> Optional[ManualQuestionRegion]:
+            for qlist in state.get("questions", {}).values():
+                for region in qlist:
+                    if region.id == number:
+                        return region
+            return None
+
+        def allocate_unused_question_id(
+            skip_region: Optional[ManualQuestionRegion] = None,
+        ) -> int:
+            used = {
+                region.id
+                for region in gather_all_questions()
+                if skip_region is None or region is not skip_region
+            }
+            expected = state.get("expected_total")
+            if expected:
+                for candidate in range(1, expected + 1):
+                    if candidate not in used:
+                        return candidate
+            candidate = max(used) + 1 if used else 1
+            while candidate in used:
+                candidate += 1
+            return candidate
+
+        def resolve_number_conflict(
+            value: int, keep: Optional[ManualQuestionRegion]
+        ) -> Tuple[bool, Optional[str]]:
+            existing = find_question_by_number(value)
+            if existing is None or existing is keep:
+                return True, None
+            prompt = (
+                "Question number %d is already assigned to page %d. "
+                "Reassign it to a new number?"
+                % (value, existing.page_index + 1)
+            )
+            if not messagebox.askyesno("Reassign question number?", prompt):
+                return False, None
+            new_id = allocate_unused_question_id(existing)
+            previous_id = existing.id
+            existing.id = new_id
+            if state.get("selected_qid") == previous_id and existing is not keep:
+                state["selected_qid"] = new_id
+            return True, f"Reassigned previous question #{previous_id} to #{new_id}."
+
         def sync_current_entry():
             current = state.get("current_qnum")
             if current is None:
@@ -2300,17 +2411,29 @@ def interactive_chunk_selection(
                     f"Question number must be between 1 and {expected}.",
                 )
                 return
+            selected_region = get_selected_question()
             used_set = state.get("used_qnums", set())
-            selected_id = state.get("selected_qid")
-            if value in used_set and value != selected_id:
-                messagebox.showerror(
-                    "Already used",
-                    f"Question number {value} is already assigned. Choose another.",
-                )
-                return
+            conflict_msg: Optional[str] = None
+            if value in used_set and (
+                selected_region is None or selected_region.id != value
+            ):
+                ok, conflict_msg = resolve_number_conflict(value, selected_region)
+                if not ok:
+                    sync_current_entry()
+                    set_status(
+                        f"Question number {value} remains assigned to its existing region."
+                    )
+                    return
+                if conflict_msg:
+                    recompute_used_numbers()
             state["current_qnum"] = value
             recalc_number_state()
-            set_status(f"Current question number set to {value}.")
+            draw_overlays()
+            update_selection_label()
+            if conflict_msg:
+                set_status(f"{conflict_msg} Current question number set to {value}.")
+            else:
+                set_status(f"Current question number set to {value}.")
 
         def assign_selected_question_number():
             q = get_selected_question()
@@ -2342,11 +2465,10 @@ def interactive_chunk_selection(
                     f"Question number must be between 1 and {expected}.",
                 )
                 return
-            used_set = state.get("used_qnums", set())
-            if value in used_set and value != q.id:
-                messagebox.showerror(
-                    "Already used",
-                    f"Question number {value} is already assigned to another region.",
+            ok, conflict_msg = resolve_number_conflict(value, q)
+            if not ok:
+                set_status(
+                    f"Assignment cancelled; question number {value} remains with its current region."
                 )
                 return
             q.id = value
@@ -2355,7 +2477,12 @@ def interactive_chunk_selection(
             recalc_number_state()
             draw_overlays()
             update_selection_label()
-            set_status(f"Assigned question #{value} to the selected region.")
+            if conflict_msg:
+                set_status(
+                    f"{conflict_msg} Assigned question #{value} to the selected region."
+                )
+            else:
+                set_status(f"Assigned question #{value} to the selected region.")
 
         def pdf_to_canvas_coords(x: float, y: float) -> Tuple[float, float]:
             zoom = state.get("zoom", 1.0)
@@ -2409,6 +2536,7 @@ def interactive_chunk_selection(
             canvas.delete("overlay")
             L_bbox = state.get("L_bbox")
             R_bbox = state.get("R_bbox")
+            zoom = state.get("zoom", 1.0)
             if L_bbox:
                 x0, y0 = pdf_to_canvas_coords(L_bbox[0], L_bbox[1])
                 x1, y1 = pdf_to_canvas_coords(L_bbox[2], L_bbox[3])
@@ -2442,6 +2570,7 @@ def interactive_chunk_selection(
                 x0, y0 = pdf_to_canvas_coords(rect[0], rect[1])
                 x1, y1 = pdf_to_canvas_coords(rect[2], rect[3])
                 width = 3 if region.id == state.get("selected_qid") else 2
+                width = max(1, int(round(width * zoom)))
                 color = "#5cb85c" if region.id == state.get("selected_qid") else "#3fa34d"
                 canvas.create_rectangle(
                     x0,
@@ -2452,16 +2581,33 @@ def interactive_chunk_selection(
                     width=width,
                     tags=("overlay", "question"),
                 )
-                canvas.create_text(
-                    x0 + 6,
-                    y0 + 12,
-                    text=str(region.id),
-                    fill="white",
-                    font=("Helvetica", 10, "bold"),
+                label = str(region.id)
+                font_size = max(9, int(round(11 * zoom)))
+                text_x = x0 + 6 * zoom
+                text_y = y0 + 6 * zoom
+                text_id = canvas.create_text(
+                    text_x,
+                    text_y,
+                    text=label,
+                    fill="#ffffff",
+                    font=("Helvetica", font_size, "bold"),
                     anchor="nw",
                     tags=("overlay", "label"),
                 )
-    
+                bbox = canvas.bbox(text_id)
+                if bbox:
+                    pad = max(2, int(round(4 * zoom)))
+                    bg_id = canvas.create_rectangle(
+                        bbox[0] - pad,
+                        bbox[1] - pad,
+                        bbox[2] + pad,
+                        bbox[3] + pad,
+                        fill="#1a1a1a",
+                        outline="",
+                        tags=("overlay", "label_bg"),
+                    )
+                    canvas.tag_lower(bg_id, text_id)
+
                 opt_rect = region.normalized_options_rect()
                 if opt_rect:
                     ox0, oy0 = pdf_to_canvas_coords(opt_rect[0], opt_rect[1])
@@ -2472,11 +2618,11 @@ def interactive_chunk_selection(
                         ox1,
                         oy1,
                         outline="#2fa8ff",
-                        width=2,
+                        width=max(1, int(round(2 * zoom))),
                         dash=(6, 3),
                         tags=("overlay", "options"),
                     )
-    
+
                 for opt_idx, opt_box in region.iter_option_rects():
                     bx0, by0 = pdf_to_canvas_coords(opt_box[0], opt_box[1])
                     bx1, by1 = pdf_to_canvas_coords(opt_box[2], opt_box[3])
@@ -2486,15 +2632,15 @@ def interactive_chunk_selection(
                         bx1,
                         by1,
                         outline="#ff6f61",
-                        width=2,
+                        width=max(1, int(round(2 * zoom))),
                         tags=("overlay", "opt"),
                     )
                     canvas.create_text(
-                        bx0 + 6,
-                        by0 + 12,
+                        bx0 + 6 * zoom,
+                        by0 + 6 * zoom,
                         text=str(opt_idx),
                         fill="#ff6f61",
-                        font=("Helvetica", 9, "bold"),
+                        font=("Helvetica", max(8, int(round(10 * zoom))), "bold"),
                         anchor="nw",
                         tags=("overlay", "optlabel"),
                     )
@@ -3385,12 +3531,59 @@ def process_single_pdf(
         logger.info("Saved searchable OCR PDF to %s", searchable_pdf_path)
     if bbox_overlay_pdf_path:
         dpi = bbox_overlay_pdf_dpi or (ocr_settings.dpi if ocr_settings else 800)
+        overlay_map: Dict[int, Dict[int, Tuple[float, float, float, float]]] = {}
+        for item in qa:
+            content = item.get("content") or {}
+            qnum = content.get("question_number")
+            if qnum is None:
+                continue
+            try:
+                qnum_int = int(qnum)
+            except (TypeError, ValueError):
+                qnum_int = qnum
+            pieces = (content.get("source") or {}).get("pieces") or []
+            for piece in pieces:
+                try:
+                    page_index = int(piece.get("page", 0))
+                except (TypeError, ValueError):
+                    continue
+                box = piece.get("box") or {}
+                x0 = _safe_float(box.get("x0"), 0.0)
+                top = _safe_float(box.get("top"), 0.0)
+                x1 = _safe_float(box.get("x1"), 0.0)
+                bottom = _safe_float(box.get("bottom"), 0.0)
+                per_page = overlay_map.setdefault(page_index, {})
+                prev = per_page.get(qnum_int)
+                if prev:
+                    per_page[qnum_int] = (
+                        min(prev[0], x0),
+                        min(prev[1], top),
+                        max(prev[2], x1),
+                        max(prev[3], bottom),
+                    )
+                else:
+                    per_page[qnum_int] = (x0, top, x1, bottom)
+        def _overlay_sort_key(item: Tuple[object, Tuple[float, float, float, float]]):
+            key, _bbox = item
+            try:
+                return (0, int(key))
+            except (TypeError, ValueError):
+                return (1, str(key))
+
+        question_box_map = {
+            page: [
+                {"question_number": qnum, "box": bbox}
+                for qnum, bbox in sorted(entries.items(), key=_overlay_sort_key)
+            ]
+            for page, entries in overlay_map.items()
+        }
         save_bbox_overlay_pdf(
             pdf_path,
             bbox_overlay_pdf_path,
             dpi,
             page_word_map,
             page_text_map,
+            question_box_map=question_box_map,
         )
         logger.info("Saved OCR bounding box overlay PDF to %s", bbox_overlay_pdf_path)
     validation = validate_qa_sequence(qa, expected_question_count, start_num)
