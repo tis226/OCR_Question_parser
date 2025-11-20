@@ -9,6 +9,13 @@ tuned via new flags (for example, ``--easyocr-preprocess-threshold`` or
 ``--easyocr-korean-lexicon``). You can continue invoking the script exactly as
 before if you do not need to change those defaults.
 
+To reuse previously detected chunk bounding boxes (instead of recalculating
+them), pass ``--reuse-chunks-from <prior_output.json>``. The flag accepts a
+saved QA JSON from an earlier run or a template file that contains a
+``chunks``/``pieces`` list. Each piece should carry a page index, column tag,
+and box coordinates; the script will re-extract text inside those boxes while
+preserving the original geometry.
+
 This script mirrors the flow-based chunking approach of
 ``pdfplumber_QA_parsing_Final.py`` but replaces PDF text extraction with
 EasyOCR. Subject detection is removed – every detected chunk inside the
