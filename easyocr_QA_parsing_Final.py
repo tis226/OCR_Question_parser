@@ -2,6 +2,13 @@
 # -*- coding: utf-8 -*-
 """QA parser using EasyOCR for text extraction.
 
+Usage and CLI shape remain the same: point the script at one or more PDFs and
+it will emit chunked QA text. Recent improvements add optional preprocessing
+and Korean clean-up toggles that default to enabled but can be switched off or
+tuned via new flags (for example, ``--easyocr-preprocess-threshold`` or
+``--easyocr-korean-lexicon``). You can continue invoking the script exactly as
+before if you do not need to change those defaults.
+
 This script mirrors the flow-based chunking approach of
 ``pdfplumber_QA_parsing_Final.py`` but replaces PDF text extraction with
 EasyOCR. Subject detection is removed – every detected chunk inside the
