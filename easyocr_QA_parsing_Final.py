@@ -956,7 +956,7 @@ def _normalize_chunk_template(template: Dict[str, object]) -> Optional[Dict[str,
         if not bbox:
             continue
         col = piece.get("col") or raw_box.get("col") if isinstance(raw_box, dict) else None
-        pieces.append({
+        normalized_piece: Dict[str, object] = {
             "page": page_index,
             "col": col or "?",
             "box": {
@@ -965,7 +965,22 @@ def _normalize_chunk_template(template: Dict[str, object]) -> Optional[Dict[str,
                 "x1": bbox[2],
                 "bottom": bbox[3],
             },
-        })
+        }
+
+        if isinstance(piece.get("text"), str):
+            normalized_piece["text"] = piece["text"]
+        if isinstance(piece.get("lines"), list):
+            normalized_piece["lines"] = [
+                {**ln, "column": ln.get("column") or col}
+                for ln in piece["lines"]
+                if isinstance(ln, dict)
+            ]
+        if isinstance(piece.get("start_line"), int):
+            normalized_piece["start_line"] = piece["start_line"]
+        if isinstance(piece.get("end_line"), int):
+            normalized_piece["end_line"] = piece["end_line"]
+
+        pieces.append(normalized_piece)
 
     if not pieces:
         return None
@@ -1035,9 +1050,23 @@ def build_chunks_from_templates(
             except Exception:
                 continue
             col_tag = raw_piece.get("col") or bbox_dict.get("col") if isinstance(bbox_dict, dict) else None
-            lines = extractor.extract_lines(page_index, bbox, y_tol=y_tol, column_tag=col_tag)
-            lines_sorted = sorted(lines, key=lambda ln: (ln.get("top", 0.0), ln.get("x0", 0.0)))
-            text = "\n".join(str(ln.get("text") or "") for ln in lines_sorted if str(ln.get("text") or "").strip())
+            extracted_lines = extractor.extract_lines(page_index, bbox, y_tol=y_tol, column_tag=col_tag)
+            fallback_lines = raw_piece.get("lines") if isinstance(raw_piece.get("lines"), list) else []
+            lines_with_fallback = extracted_lines or [
+                {**ln, "page": page_index, "column": ln.get("column") or col_tag}
+                for ln in fallback_lines
+                if isinstance(ln, dict)
+            ]
+            lines_sorted = sorted(lines_with_fallback, key=lambda ln: (ln.get("top", 0.0), ln.get("x0", 0.0)))
+
+            text_parts = [
+                str(ln.get("text") or "")
+                for ln in lines_sorted
+                if str(ln.get("text") or "").strip()
+            ]
+            fallback_text = raw_piece.get("text") if isinstance(raw_piece.get("text"), str) else ""
+            text = "\n".join(text_parts) if text_parts else fallback_text
+
             if lines_sorted:
                 x0 = min(_safe_float(ln.get("x0"), 0.0) for ln in lines_sorted)
                 x1 = max(_safe_float(ln.get("x1"), 0.0) for ln in lines_sorted)
