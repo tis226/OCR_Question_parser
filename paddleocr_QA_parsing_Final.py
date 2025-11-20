@@ -46,6 +46,7 @@ column bounding boxes is parsed.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import logging
 import math
@@ -386,11 +387,26 @@ class PaddleOCRTextExtractor:
     def __init__(self, pdf: pdfplumber.pdf.PDF, settings: OCRSettings):
         self.pdf = pdf
         self.settings = settings
-        self.reader = PaddleOCR(
-            use_angle_cls=True,
-            lang=settings.languages[0] if settings.languages else "korean",
-            use_gpu=settings.gpu,
-        )
+        reader_kwargs = {
+            "lang": settings.languages[0] if settings.languages else "korean",
+        }
+
+        # Accommodate PaddleOCR versions that renamed ``use_gpu`` to ``device``
+        # and ``use_angle_cls`` to ``use_textline_orientation``.
+        reader_sig = inspect.signature(PaddleOCR.__init__)
+        params = reader_sig.parameters
+
+        if "use_gpu" in params:
+            reader_kwargs["use_gpu"] = settings.gpu
+        elif "device" in params:
+            reader_kwargs["device"] = "gpu:0" if settings.gpu else "cpu"
+
+        if "use_textline_orientation" in params:
+            reader_kwargs["use_textline_orientation"] = True
+        elif "use_angle_cls" in params:
+            reader_kwargs["use_angle_cls"] = True
+
+        self.reader = PaddleOCR(**reader_kwargs)
         self._image_cache: Dict[int, Image.Image] = {}
         self._scale = settings.dpi / 72.0
         self.page_word_boxes: Dict[int, List[Dict[str, object]]] = {}
