@@ -180,6 +180,19 @@ def _korean_postprocess_text(text: str, settings: OCRSettings) -> str:
     return "".join(corrected)
 
 
+def _coerce_bbox(box: Dict[str, object]) -> Optional[Tuple[float, float, float, float]]:
+    try:
+        x0 = _safe_float(box.get("x0"), None)
+        x1 = _safe_float(box.get("x1"), None)
+        top = _safe_float(box.get("top"), None)
+        bottom = _safe_float(box.get("bottom"), None)
+    except Exception:
+        return None
+    if None in (x0, x1, top, bottom):
+        return None
+    return float(x0), float(top), float(x1), float(bottom)
+
+
 # =========================
 # Logging helpers
 # =========================
@@ -893,6 +906,139 @@ def flow_chunk_all_pages(
             per_page_boxes[p["page"]].append(b)
 
     return chunks, per_page_boxes, page_text_map
+
+
+def _normalize_chunk_template(template: Dict[str, object]) -> Optional[Dict[str, object]]:
+    pieces_in = template.get("pieces") if isinstance(template, dict) else None
+    if not isinstance(pieces_in, list):
+        return None
+
+    qnum = template.get("question_number") if isinstance(template, dict) else None
+    pieces: List[Dict[str, object]] = []
+    for piece in pieces_in:
+        if not isinstance(piece, dict):
+            continue
+        page = piece.get("page")
+        try:
+            page_index = int(page)
+        except Exception:
+            continue
+        raw_box = piece.get("box") if isinstance(piece.get("box"), dict) else piece
+        bbox = _coerce_bbox(raw_box if isinstance(raw_box, dict) else {})
+        if not bbox:
+            continue
+        col = piece.get("col") or raw_box.get("col") if isinstance(raw_box, dict) else None
+        pieces.append({
+            "page": page_index,
+            "col": col or "?",
+            "box": {
+                "x0": bbox[0],
+                "top": bbox[1],
+                "x1": bbox[2],
+                "bottom": bbox[3],
+            },
+        })
+
+    if not pieces:
+        return None
+
+    normalized = {"pieces": pieces}
+    if qnum is not None:
+        normalized["question_number"] = qnum
+    return normalized
+
+
+def load_chunk_templates_from_json(path: str) -> List[Dict[str, object]]:
+    abs_path = os.path.abspath(os.path.expanduser(path))
+    if not os.path.exists(abs_path):
+        raise FileNotFoundError(abs_path)
+
+    with open(abs_path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+
+    templates: List[Dict[str, object]] = []
+
+    def _maybe_add(entry: Optional[Dict[str, object]]):
+        if entry:
+            templates.append(entry)
+
+    if isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content") if isinstance(item.get("content"), dict) else None
+            source = content.get("source") if content else None
+            pieces = source.get("pieces") if isinstance(source, dict) else None
+            template = {
+                "pieces": pieces or item.get("pieces") or [],
+                "question_number": (content or {}).get("question_number"),
+            }
+            _maybe_add(_normalize_chunk_template(template))
+    elif isinstance(data, dict):
+        raw_chunks = data.get("chunks") if isinstance(data.get("chunks"), list) else None
+        if raw_chunks is None:
+            raw_chunks = [data] if data.get("pieces") else []
+        for item in raw_chunks:
+            _maybe_add(_normalize_chunk_template(item if isinstance(item, dict) else {}))
+
+    return templates
+
+
+def build_chunks_from_templates(
+    templates: Sequence[Dict[str, object]],
+    extractor: EasyOCRTextExtractor,
+    y_tol: float,
+) -> List[Dict[str, object]]:
+    built: List[Dict[str, object]] = []
+    for tpl_idx, tpl in enumerate(templates, start=1):
+        pieces: List[Dict[str, object]] = []
+        raw_pieces = tpl.get("pieces") if isinstance(tpl, dict) else None
+        if not isinstance(raw_pieces, list):
+            continue
+        for raw_piece in raw_pieces:
+            if not isinstance(raw_piece, dict):
+                continue
+            bbox_dict = raw_piece.get("box") if isinstance(raw_piece.get("box"), dict) else raw_piece
+            bbox = _coerce_bbox(bbox_dict if isinstance(bbox_dict, dict) else {})
+            if not bbox:
+                continue
+            try:
+                page_index = int(raw_piece.get("page"))
+            except Exception:
+                continue
+            col_tag = raw_piece.get("col") or bbox_dict.get("col") if isinstance(bbox_dict, dict) else None
+            lines = extractor.extract_lines(page_index, bbox, y_tol=y_tol, column_tag=col_tag)
+            lines_sorted = sorted(lines, key=lambda ln: (ln.get("top", 0.0), ln.get("x0", 0.0)))
+            text = "\n".join(str(ln.get("text") or "") for ln in lines_sorted if str(ln.get("text") or "").strip())
+            if lines_sorted:
+                x0 = min(_safe_float(ln.get("x0"), 0.0) for ln in lines_sorted)
+                x1 = max(_safe_float(ln.get("x1"), 0.0) for ln in lines_sorted)
+                top = min(_safe_float(ln.get("top"), bbox[1]) for ln in lines_sorted)
+                bottom = max(_safe_float(ln.get("bottom"), bbox[3]) for ln in lines_sorted)
+            else:
+                x0, top, x1, bottom = bbox
+            pieces.append(
+                {
+                    "page": page_index,
+                    "col": col_tag or "?",
+                    "box": {"x0": x0, "top": top, "x1": x1, "bottom": bottom},
+                    "start_line": 0,
+                    "end_line": max(len(lines_sorted) - 1, 0),
+                    "text": text or raw_piece.get("text") or "",
+                    "lines": lines_sorted,
+                }
+            )
+
+        if not pieces:
+            continue
+
+        chunk: Dict[str, object] = {"pieces": pieces}
+        qnum = tpl.get("question_number") if isinstance(tpl, dict) else None
+        if qnum is not None:
+            chunk["manual"] = {"question_id": qnum}
+        built.append(chunk)
+
+    return built
 
 
 def build_manual_chunks_from_regions(
@@ -2079,6 +2225,8 @@ def pdf_to_qa_flow_chunks(
     failed_chunk_log_chars: int = 240,
     manual_questions: Optional[Sequence[ManualQuestionRegion]] = None,
     manual_only: bool = False,
+    reuse_chunk_templates: Optional[Sequence[Dict[str, object]]] = None,
+    reuse_chunk_source: Optional[str] = None,
 ):
     if ocr_settings is None:
         ocr_settings = OCRSettings()
@@ -2113,60 +2261,89 @@ def pdf_to_qa_flow_chunks(
         ycut_map: Dict[int, Optional[float]] = {}
         band_map: Dict[int, Optional[Tuple[float, float, float, float]]] = {}
 
-        chunks, _, page_text_map = flow_chunk_all_pages(
-            pdf,
-            extractor,
-            L_rel,
-            R_rel,
-            y_tol,
-            tol,
-            top_frac,
-            bottom_frac,
-            gutter_frac,
-            clip_mode=clip_mode,
-            ycut_map=ycut_map,
-            band_map=band_map,
-            skip_chunk_detection=manual_only,
-        )
-        auto_chunk_count = len(chunks)
-        manual_region_count = len(manual_questions or [])
-        if manual_only:
-            if manual_region_count:
+        page_text_map = {i: [] for i in range(len(pdf.pages))}
+
+        if reuse_chunk_templates:
+            if manual_questions:
                 logger.info(
-                    "Manual-only mode enabled: discarding %d auto-detected chunks in favor of %d manual regions.",
-                    auto_chunk_count,
-                    manual_region_count,
+                    "Ignoring %d manual regions because saved chunk templates are being reused.",
+                    len(manual_questions),
                 )
-            elif auto_chunk_count:
+            if manual_only:
                 logger.info(
-                    "Manual-only mode enabled: discarding %d auto-detected chunks (no manual regions supplied).",
-                    auto_chunk_count,
+                    "Manual-only flag is overridden when reusing chunk templates.",
                 )
-            else:
-                logger.info(
-                    "Manual-only mode enabled: no manual regions supplied, no automatic chunks available.",
-                )
-            chunks = []
-        if manual_questions:
-            if not manual_only:
-                logger.info(
-                    "Manual chunk selection provided %d regions; replacing %d automatic chunks.",
-                    manual_region_count,
-                    auto_chunk_count,
-                )
-            else:
-                logger.debug(
-                    "Manual-only mode building %d chunks from manual regions.",
-                    manual_region_count,
-                )
-            chunks = build_manual_chunks_from_regions(
-                manual_questions,
-                page_text_map,
+            manual_only = False
+            manual_questions = None
+            chunks = build_chunks_from_templates(reuse_chunk_templates, extractor, y_tol)
+            for ch in chunks:
+                for piece in ch.get("pieces") or []:
+                    page_index = int(piece.get("page", 0))
+                    for ln in piece.get("lines") or []:
+                        copy = dict(ln)
+                        copy.setdefault("column", piece.get("col"))
+                        page_text_map.setdefault(page_index, []).append(copy)
+            for lines in page_text_map.values():
+                lines.sort(key=lambda ln: (ln.get("top", 0.0), ln.get("x0", 0.0)))
+            auto_chunk_count = len(chunks)
+            logger.info(
+                "Reused %d chunk boxes from %s", auto_chunk_count, reuse_chunk_source or "saved templates"
+            )
+        else:
+            chunks, _, page_text_map = flow_chunk_all_pages(
                 pdf,
+                extractor,
+                L_rel,
+                R_rel,
+                y_tol,
+                tol,
                 top_frac,
                 bottom_frac,
                 gutter_frac,
+                clip_mode=clip_mode,
+                ycut_map=ycut_map,
+                band_map=band_map,
+                skip_chunk_detection=manual_only,
             )
+            auto_chunk_count = len(chunks)
+            manual_region_count = len(manual_questions or [])
+            if manual_only:
+                if manual_region_count:
+                    logger.info(
+                        "Manual-only mode enabled: discarding %d auto-detected chunks in favor of %d manual regions.",
+                        auto_chunk_count,
+                        manual_region_count,
+                    )
+                elif auto_chunk_count:
+                    logger.info(
+                        "Manual-only mode enabled: discarding %d auto-detected chunks (no manual regions supplied).",
+                        auto_chunk_count,
+                    )
+                else:
+                    logger.info(
+                        "Manual-only mode enabled: no manual regions supplied, no automatic chunks available.",
+                    )
+                chunks = []
+            if manual_questions:
+                if not manual_only:
+                    logger.info(
+                        "Manual chunk selection provided %d regions; replacing %d automatic chunks.",
+                        manual_region_count,
+                        auto_chunk_count,
+                    )
+                else:
+                    logger.debug(
+                        "Manual-only mode building %d chunks from manual regions.",
+                        manual_region_count,
+                    )
+                chunks = build_manual_chunks_from_regions(
+                    manual_questions,
+                    page_text_map,
+                    pdf,
+                    top_frac,
+                    bottom_frac,
+                    gutter_frac,
+                )
         logger.info("Detected %d raw chunks before QA filtering", len(chunks))
 
         for idx, ch in enumerate(chunks, start=1):
@@ -3595,6 +3772,7 @@ def process_single_pdf(
     expected_question_count: Optional[int] = None,
     fail_on_incomplete: bool = False,
     manual_only: bool = False,
+    reuse_chunks_from: Optional[str] = None,
 ):
     if year is None:
         year = infer_year_from_filename(pdf_path) or datetime.now().year
@@ -3677,6 +3855,17 @@ def process_single_pdf(
     )
     heartbeat.start()
 
+    reuse_templates: Optional[List[Dict[str, object]]] = None
+    reuse_source: Optional[str] = None
+    if reuse_chunks_from:
+        reuse_source = os.path.abspath(os.path.expanduser(reuse_chunks_from))
+        reuse_templates = load_chunk_templates_from_json(reuse_source)
+        logger.info(
+            "Loaded %d chunk templates from %s for reuse",
+            len(reuse_templates),
+            reuse_source,
+        )
+
     crop_report_map: Dict[int, List[Dict[str, Any]]] = {}
     try:
         qa, page_text_map, page_word_map, crop_report_map = pdf_to_qa_flow_chunks(
@@ -3699,6 +3888,8 @@ def process_single_pdf(
             failed_chunk_log_chars=failed_chunk_log_chars,
             manual_questions=manual_regions if manual_regions is not None else None,
             manual_only=manual_only,
+            reuse_chunk_templates=reuse_templates,
+            reuse_chunk_source=reuse_source,
         )
     finally:
         heartbeat.stop()
@@ -3871,6 +4062,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=240,
         help="Max characters of chunk text to include in skip warnings",
+    )
+    ap.add_argument(
+        "--reuse-chunks-from",
+        help=(
+            "Path to a prior QA JSON or chunk template file whose bounding boxes should be reused instead of re-detecting"
+        ),
     )
 
     ap.add_argument(
@@ -4348,6 +4545,7 @@ def main():
                 expected_question_count=args.expected_question_count,
                 fail_on_incomplete=args.fail_on_incomplete,
                 manual_only=args.manual_only,
+                reuse_chunks_from=args.reuse_chunks_from,
             )
         except RuntimeError as exc:
             logger.error("Validation failed for %s: %s", pdf_path, exc)
