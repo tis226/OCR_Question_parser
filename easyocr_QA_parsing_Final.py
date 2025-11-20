@@ -14,15 +14,28 @@ them), pass ``--reuse-chunks-from <prior_output.json>``. The flag accepts a
 saved QA JSON from an earlier run or a template file that contains a
 ``chunks``/``pieces`` list. Each piece should carry a page index, column tag,
 and box coordinates; the script will re-extract text inside those boxes while
-preserving the original geometry. For example::
+preserving the original geometry. Quick examples::
 
+    # Re-OCR a new PDF but reuse boxes from an earlier run
     python easyocr_QA_parsing_Final.py new_input.pdf \
       --reuse-chunks-from prior_run.json --output-json new_run.json
 
-Here ``prior_run.json`` is the JSON produced by a previous invocation of the
-script (or another template file with the same structure). The script will
-reuse the boxes from that file and write the fresh OCR/text results to
-``new_run.json``.
+    # Reuse boxes while also writing chunk previews for auditing
+    python easyocr_QA_parsing_Final.py input.pdf \
+      --reuse-chunks-from prior_run.json \
+      --chunk-preview-dir previews/reused_boxes
+
+    # Apply reuse plus Korean cleanup options explicitly
+    python easyocr_QA_parsing_Final.py input.pdf \
+      --reuse-chunks-from prior_run.json \
+      --easyocr-korean-lexicon common_terms.txt \
+      --easyocr-preprocess-threshold 140
+
+In each case ``prior_run.json`` is the JSON produced by a previous invocation
+of the script (or another template file with the same structure). The script
+reuses the boxes from that file and writes fresh OCR/text results to the
+specified output JSON. Add optional preview or preprocessing flags as desired
+while the geometry stays anchored to the prior run.
 
 This script mirrors the flow-based chunking approach of
 ``pdfplumber_QA_parsing_Final.py`` but replaces PDF text extraction with
