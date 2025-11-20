@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""QA parser using EasyOCR for text extraction.
+"""QA parser using PaddleOCR for text extraction.
 
-Usage and CLI shape remain the same: point the script at one or more PDFs and
-it will emit chunked QA text. Recent improvements add optional preprocessing
-and Korean clean-up toggles that default to enabled but can be switched off or
-tuned via new flags (for example, ``--easyocr-preprocess-threshold`` or
-``--easyocr-korean-lexicon``). You can continue invoking the script exactly as
-before if you do not need to change those defaults.
+Usage and CLI shape mirror the PaddleOCR-based script: point the script at one or
+more PDFs and it will emit chunked QA text. Recent improvements add optional
+preprocessing and Korean clean-up toggles that default to enabled but can be
+switched off or tuned via new flags (for example, ``--paddleocr-preprocess-
+threshold`` or ``--paddleocr-korean-lexicon``). You can continue invoking the
+script exactly as before if you do not need to change those defaults.
 
 To reuse previously detected chunk bounding boxes (instead of recalculating
 them), pass ``--reuse-chunks-from <prior_output.json>``. The flag accepts a
@@ -17,19 +17,19 @@ and box coordinates; the script will re-extract text inside those boxes while
 preserving the original geometry. Quick examples::
 
     # Re-OCR a new PDF but reuse boxes from an earlier run
-    python easyocr_QA_parsing_Final.py new_input.pdf \
+    python paddleocr_QA_parsing_Final.py new_input.pdf \
       --reuse-chunks-from prior_run.json --output-json new_run.json
 
     # Reuse boxes while also writing chunk previews for auditing
-    python easyocr_QA_parsing_Final.py input.pdf \
+    python paddleocr_QA_parsing_Final.py input.pdf \
       --reuse-chunks-from prior_run.json \
       --chunk-preview-dir previews/reused_boxes
 
     # Apply reuse plus Korean cleanup options explicitly
-    python easyocr_QA_parsing_Final.py input.pdf \
+    python paddleocr_QA_parsing_Final.py input.pdf \
       --reuse-chunks-from prior_run.json \
-      --easyocr-korean-lexicon common_terms.txt \
-      --easyocr-preprocess-threshold 140
+      --paddleocr-korean-lexicon common_terms.txt \
+      --paddleocr-preprocess-threshold 140
 
 In each case ``prior_run.json`` is the JSON produced by a previous invocation
 of the script (or another template file with the same structure). The script
@@ -39,13 +39,14 @@ while the geometry stays anchored to the prior run.
 
 This script mirrors the flow-based chunking approach of
 ``pdfplumber_QA_parsing_Final.py`` but replaces PDF text extraction with
-EasyOCR. Subject detection is removed – every detected chunk inside the
+PaddleOCR. Subject detection is removed – every detected chunk inside the
 column bounding boxes is parsed.
 """
 
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import logging
 import math
@@ -59,12 +60,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-try:  # EasyOCR is only needed at runtime; allow import for tooling/tests without it.
-    import easyocr  # type: ignore
-except Exception:  # pragma: no cover - handled lazily when constructing the reader.
-    easyocr = None  # type: ignore[assignment]
 import numpy as np
 import pdfplumber
+from paddleocr import PaddleOCR
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
 
@@ -363,12 +361,12 @@ def infer_year_from_filename(path: str) -> Optional[int]:
 
 
 # =========================
-# EasyOCR extraction
+# PaddleOCR extraction
 # =========================
 @dataclass
 class OCRSettings:
     dpi: int = 1000
-    languages: Sequence[str] = ("ko",)
+    languages: Sequence[str] = ("korean",)
     gpu: bool = False
     column_pad_x: float = 2.0
     column_pad_top: float = 2.0
@@ -383,23 +381,38 @@ class OCRSettings:
     korean_lexicon: Sequence[str] = field(default_factory=lambda: DEFAULT_KOREAN_LEXICON)
 
 
-class EasyOCRTextExtractor:
-    """Render PDF pages to images and run EasyOCR within bboxes."""
+class PaddleOCRTextExtractor:
+    """Render PDF pages to images and run PaddleOCR within bboxes."""
 
     def __init__(self, pdf: pdfplumber.pdf.PDF, settings: OCRSettings):
-        if easyocr is None:
-            raise ImportError(
-                "easyocr is not installed. Install it with 'pip install easyocr' to use this script."
-            )
         self.pdf = pdf
         self.settings = settings
-        self.reader = easyocr.Reader(list(settings.languages), gpu=settings.gpu)
+        reader_kwargs = {
+            "lang": settings.languages[0] if settings.languages else "korean",
+        }
+
+        # Accommodate PaddleOCR versions that renamed ``use_gpu`` to ``device``
+        # and ``use_angle_cls`` to ``use_textline_orientation``.
+        reader_sig = inspect.signature(PaddleOCR.__init__)
+        params = reader_sig.parameters
+
+        if "use_gpu" in params:
+            reader_kwargs["use_gpu"] = settings.gpu
+        elif "device" in params:
+            reader_kwargs["device"] = "gpu:0" if settings.gpu else "cpu"
+
+        if "use_textline_orientation" in params:
+            reader_kwargs["use_textline_orientation"] = True
+        elif "use_angle_cls" in params:
+            reader_kwargs["use_angle_cls"] = True
+
+        self.reader = PaddleOCR(**reader_kwargs)
         self._image_cache: Dict[int, Image.Image] = {}
         self._scale = settings.dpi / 72.0
         self.page_word_boxes: Dict[int, List[Dict[str, object]]] = {}
         self.crop_reports: Dict[int, List[Dict[str, Any]]] = {}
         logger.debug(
-            "Initialized EasyOCRTextExtractor: dpi=%s languages=%s gpu=%s pads(x=%.1f top=%.1f bottom=%.1f) filters(top=%.1f bottom=%.1f)",
+            "Initialized PaddleOCRTextExtractor: dpi=%s languages=%s gpu=%s pads(x=%.1f top=%.1f bottom=%.1f) filters(top=%.1f bottom=%.1f)",
             settings.dpi,
             ",".join(settings.languages),
             settings.gpu,
@@ -545,11 +558,26 @@ class EasyOCRTextExtractor:
 
         crop = im.crop(crop_box)
         np_img = np.array(crop)
-        results = self.reader.readtext(np_img)
+        results = self.reader.ocr(np_img, cls=True)
+
+        if results and isinstance(results[0], list) and results and isinstance(
+            results[0][0], list
+        ):
+            parsed_results = results[0]
+        else:
+            parsed_results = results
 
         entries = []
         word_entries: List[Dict[str, object]] = []
-        for pts, text, conf in results:
+        for item in parsed_results:
+            if not item or len(item) < 2:
+                continue
+            pts = item[0]
+            text_conf = item[1]
+            if isinstance(text_conf, (list, tuple)) and len(text_conf) >= 2:
+                text, conf = text_conf[0], text_conf[1]
+            else:
+                text, conf = str(text_conf), None
             if not text:
                 continue
             xs = [p[0] for p in pts]
@@ -769,7 +797,7 @@ def detect_question_starts(
 
 def build_flow_segments(
     pdf: pdfplumber.pdf.PDF,
-    extractor: EasyOCRTextExtractor,
+    extractor: PaddleOCRTextExtractor,
     top_frac: float,
     bottom_frac: float,
     gutter_frac: float,
@@ -800,7 +828,7 @@ def build_flow_segments(
 
 def flow_chunk_all_pages(
     pdf: pdfplumber.pdf.PDF,
-    extractor: EasyOCRTextExtractor,
+    extractor: PaddleOCRTextExtractor,
     L_rel_offset: Optional[float],
     R_rel_offset: Optional[float],
     y_tol: float,
@@ -1029,7 +1057,7 @@ def load_chunk_templates_from_json(path: str) -> List[Dict[str, object]]:
 
 def build_chunks_from_templates(
     templates: Sequence[Dict[str, object]],
-    extractor: EasyOCRTextExtractor,
+    extractor: PaddleOCRTextExtractor,
     y_tol: float,
 ) -> List[Dict[str, object]]:
     built: List[Dict[str, object]] = []
@@ -2314,7 +2342,7 @@ def pdf_to_qa_flow_chunks(
             year,
             start_num,
         )
-        extractor = EasyOCRTextExtractor(pdf, ocr_settings)
+        extractor = PaddleOCRTextExtractor(pdf, ocr_settings)
         ycut_map: Dict[int, Optional[float]] = {}
         band_map: Dict[int, Optional[Tuple[float, float, float, float]]] = {}
 
@@ -4068,7 +4096,7 @@ def process_single_pdf(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
-        description="Parse QA pairs from exam PDFs using EasyOCR for text extraction."
+        description="Parse QA pairs from exam PDFs using PaddleOCR for text extraction."
     )
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--pdf", help="Input single PDF file")
@@ -4128,80 +4156,80 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     ap.add_argument(
-        "--easyocr-dpi", type=int, default=1000, help="Rendering DPI for EasyOCR"
+        "--paddleocr-dpi", type=int, default=1000, help="Rendering DPI for PaddleOCR"
     )
     ap.add_argument(
-        "--easyocr-langs",
-        default="ko",
-        help="Comma-separated EasyOCR language codes",
+        "--paddleocr-langs",
+        default="korean",
+        help="Comma-separated PaddleOCR language codes",
     )
     ap.add_argument(
-        "--easyocr-gpu",
+        "--paddleocr-gpu",
         action="store_true",
-        help="Enable GPU acceleration for EasyOCR if available",
+        help="Enable GPU acceleration for PaddleOCR if available",
     )
     ap.add_argument(
-        "--easyocr-column-pad-x",
+        "--paddleocr-column-pad-x",
         type=float,
         default=2.0,
         help="Horizontal padding (pt) added to each column crop before OCR",
     )
     ap.add_argument(
-        "--easyocr-column-pad-top",
+        "--paddleocr-column-pad-top",
         type=float,
         default=2.0,
         help="Top padding (pt) added to each column crop before OCR",
     )
     ap.add_argument(
-        "--easyocr-column-pad-bottom",
+        "--paddleocr-column-pad-bottom",
         type=float,
         default=60.0,
         help="Bottom padding (pt) added to each column crop before OCR",
     )
     ap.add_argument(
-        "--easyocr-column-filter-top",
+        "--paddleocr-column-filter-top",
         type=float,
         default=4.0,
         help="Extra tolerance (pt) above the column window when keeping OCR words",
     )
     ap.add_argument(
-        "--easyocr-column-filter-bottom",
+        "--paddleocr-column-filter-bottom",
         type=float,
         default=60.0,
         help="Extra tolerance (pt) below the column window when keeping OCR words",
     )
 
     ap.add_argument(
-        "--easyocr-preprocess",
+        "--paddleocr-preprocess",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Apply light denoising/sharpening before OCR (default: enabled)",
     )
     ap.add_argument(
-        "--easyocr-preprocess-contrast",
+        "--paddleocr-preprocess-contrast",
         type=float,
         default=1.25,
         help="Contrast boost factor applied during OCR preprocessing",
     )
     ap.add_argument(
-        "--easyocr-preprocess-unsharp",
+        "--paddleocr-preprocess-unsharp",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Apply an unsharp mask during OCR preprocessing",
     )
     ap.add_argument(
-        "--easyocr-preprocess-threshold",
+        "--paddleocr-preprocess-threshold",
         type=int,
         help="Optional binarization threshold (0-255) applied after sharpening/contrast",
     )
     ap.add_argument(
-        "--easyocr-korean-postprocess",
+        "--paddleocr-korean-postprocess",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Apply Korean lexicon-based cleanup to OCR text",
     )
     ap.add_argument(
-        "--easyocr-korean-lexicon",
+        "--paddleocr-korean-lexicon",
         help="Path to a newline-delimited lexicon used for Korean OCR cleanup",
     )
 
@@ -4212,7 +4240,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--raster-pdf-dpi",
         type=int,
-        help="DPI to use for raster PDF export (defaults to EasyOCR DPI)",
+        help="DPI to use for raster PDF export (defaults to PaddleOCR DPI)",
     )
 
     ap.add_argument(
@@ -4237,7 +4265,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--bbox-overlay-pdf-dpi",
         type=int,
-        help="DPI to use for the bounding-box overlay PDF (defaults to EasyOCR DPI)",
+        help="DPI to use for the bounding-box overlay PDF (defaults to PaddleOCR DPI)",
     )
 
     ap.add_argument(
@@ -4478,10 +4506,10 @@ def main():
             crop_report_paths = [None] * len(pdfs)
 
     korean_lexicon: Optional[Sequence[str]] = None
-    if args.easyocr_korean_lexicon:
+    if args.paddleocr_korean_lexicon:
         try:
             with open(
-                os.path.abspath(os.path.expanduser(args.easyocr_korean_lexicon)),
+                os.path.abspath(os.path.expanduser(args.paddleocr_korean_lexicon)),
                 "r",
                 encoding="utf-8",
             ) as fh:
@@ -4489,29 +4517,29 @@ def main():
                 logger.info(
                     "Loaded %d lexicon entries from %s",
                     len(korean_lexicon),
-                    args.easyocr_korean_lexicon,
+                    args.paddleocr_korean_lexicon,
                 )
         except OSError as exc:
             logger.warning(
                 "Failed to load Korean lexicon from %s: %s",
-                args.easyocr_korean_lexicon,
+                args.paddleocr_korean_lexicon,
                 exc,
             )
 
     ocr_settings = OCRSettings(
-        dpi=args.easyocr_dpi,
-        languages=[lang.strip() for lang in args.easyocr_langs.split(",") if lang.strip()],
-        gpu=args.easyocr_gpu,
-        column_pad_x=args.easyocr_column_pad_x,
-        column_pad_top=args.easyocr_column_pad_top,
-        column_pad_bottom=args.easyocr_column_pad_bottom,
-        column_filter_top=args.easyocr_column_filter_top,
-        column_filter_bottom=args.easyocr_column_filter_bottom,
-        preprocess_images=args.easyocr_preprocess,
-        preprocess_contrast=args.easyocr_preprocess_contrast,
-        preprocess_unsharp=args.easyocr_preprocess_unsharp,
-        preprocess_threshold=args.easyocr_preprocess_threshold,
-        korean_postprocess=args.easyocr_korean_postprocess,
+        dpi=args.paddleocr_dpi,
+        languages=[lang.strip() for lang in args.paddleocr_langs.split(",") if lang.strip()],
+        gpu=args.paddleocr_gpu,
+        column_pad_x=args.paddleocr_column_pad_x,
+        column_pad_top=args.paddleocr_column_pad_top,
+        column_pad_bottom=args.paddleocr_column_pad_bottom,
+        column_filter_top=args.paddleocr_column_filter_top,
+        column_filter_bottom=args.paddleocr_column_filter_bottom,
+        preprocess_images=args.paddleocr_preprocess,
+        preprocess_contrast=args.paddleocr_preprocess_contrast,
+        preprocess_unsharp=args.paddleocr_preprocess_unsharp,
+        preprocess_threshold=args.paddleocr_preprocess_threshold,
+        korean_postprocess=args.paddleocr_korean_postprocess,
         korean_lexicon=korean_lexicon if korean_lexicon is not None else DEFAULT_KOREAN_LEXICON,
     )
 
