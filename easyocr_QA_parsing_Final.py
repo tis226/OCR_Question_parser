@@ -14,7 +14,15 @@ them), pass ``--reuse-chunks-from <prior_output.json>``. The flag accepts a
 saved QA JSON from an earlier run or a template file that contains a
 ``chunks``/``pieces`` list. Each piece should carry a page index, column tag,
 and box coordinates; the script will re-extract text inside those boxes while
-preserving the original geometry.
+preserving the original geometry. For example::
+
+    python easyocr_QA_parsing_Final.py new_input.pdf \
+      --reuse-chunks-from prior_run.json --output-json new_run.json
+
+Here ``prior_run.json`` is the JSON produced by a previous invocation of the
+script (or another template file with the same structure). The script will
+reuse the boxes from that file and write the fresh OCR/text results to
+``new_run.json``.
 
 This script mirrors the flow-based chunking approach of
 ``pdfplumber_QA_parsing_Final.py`` but replaces PDF text extraction with
