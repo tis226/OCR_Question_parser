@@ -30,7 +30,7 @@ except Exception:  # pragma: no cover - handled lazily when constructing the rea
     easyocr = None  # type: ignore[assignment]
 import numpy as np
 import pdfplumber
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,16 @@ DEFAULT_SEARCHABLE_FONT_CANDIDATES: Tuple[str, ...] = (
     "HeiseiKakuGo-W5",
     "HeiseiMin-W3",
     "STSong-Light",
+)
+
+DEFAULT_KOREAN_LEXICON: Tuple[str, ...] = (
+    "치명률",
+    "사망률",
+    "발생률",
+    "유병률",
+    "생존율",
+    "검사율",
+    "감염률",
 )
 
 
@@ -111,6 +121,56 @@ def _normalize_visible_text(s: str) -> str:
         .replace("•", "·")
     )
     return s
+
+
+def _enhance_page_image(img: Image.Image, settings: OCRSettings) -> Image.Image:
+    if not settings.preprocess_images:
+        return img
+
+    working = img.convert("L")
+
+    if settings.preprocess_unsharp:
+        working = working.filter(
+            ImageFilter.UnsharpMask(radius=1.2, percent=180, threshold=3)
+        )
+
+    if settings.preprocess_contrast and settings.preprocess_contrast > 0:
+        working = ImageEnhance.Contrast(working).enhance(settings.preprocess_contrast)
+
+    if settings.preprocess_threshold is not None:
+        thresh = int(settings.preprocess_threshold)
+        thresh = max(0, min(255, thresh))
+        working = working.point(lambda p: 255 if p >= thresh else 0)
+
+    return working.convert("RGB")
+
+
+def _korean_postprocess_text(text: str, settings: OCRSettings) -> str:
+    if not settings.korean_postprocess:
+        return text
+
+    lexicon = set(settings.korean_lexicon)
+    if not lexicon:
+        return text
+
+    confusion_pairs = (("룰", "률"), ("율", "률"), ("률", "율"))
+    tokens = re.split(r"(\W+)", text)
+    corrected: List[str] = []
+
+    for tok in tokens:
+        if not tok or not tok.strip() or tok in lexicon:
+            corrected.append(tok)
+            continue
+
+        replacement = tok
+        for wrong, right in confusion_pairs:
+            candidate = tok.replace(wrong, right)
+            if candidate in lexicon:
+                replacement = candidate
+                break
+        corrected.append(replacement)
+
+    return "".join(corrected)
 
 
 # =========================
@@ -259,14 +319,20 @@ def infer_year_from_filename(path: str) -> Optional[int]:
 # =========================
 @dataclass
 class OCRSettings:
-    dpi: int = 800
-    languages: Sequence[str] = ("ko", "en")
+    dpi: int = 1000
+    languages: Sequence[str] = ("ko",)
     gpu: bool = False
     column_pad_x: float = 2.0
     column_pad_top: float = 2.0
     column_pad_bottom: float = 60.0
     column_filter_top: float = 4.0
     column_filter_bottom: float = 60.0
+    preprocess_images: bool = True
+    preprocess_contrast: float = 1.25
+    preprocess_unsharp: bool = True
+    preprocess_threshold: Optional[int] = None
+    korean_postprocess: bool = True
+    korean_lexicon: Sequence[str] = field(default_factory=lambda: DEFAULT_KOREAN_LEXICON)
 
 
 class EasyOCRTextExtractor:
@@ -304,6 +370,7 @@ class EasyOCRTextExtractor:
                 .to_image(resolution=int(self.settings.dpi))
                 .original.convert("RGB")
             )
+            pil = _enhance_page_image(pil, self.settings)
             self._image_cache[page_index] = pil
         return self._image_cache[page_index]
 
@@ -460,6 +527,7 @@ class EasyOCRTextExtractor:
             ):
                 continue
             normalized_text = _normalize_visible_text(text)
+            normalized_text = _korean_postprocess_text(normalized_text, self.settings)
             entries.append(
                 {
                     "x0": float(abs_x0),
@@ -3799,11 +3867,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
 
     ap.add_argument(
-        "--easyocr-dpi", type=int, default=800, help="Rendering DPI for EasyOCR"
+        "--easyocr-dpi", type=int, default=1000, help="Rendering DPI for EasyOCR"
     )
     ap.add_argument(
         "--easyocr-langs",
-        default="ko,en",
+        default="ko",
         help="Comma-separated EasyOCR language codes",
     )
     ap.add_argument(
@@ -3840,6 +3908,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=float,
         default=60.0,
         help="Extra tolerance (pt) below the column window when keeping OCR words",
+    )
+
+    ap.add_argument(
+        "--easyocr-preprocess",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply light denoising/sharpening before OCR (default: enabled)",
+    )
+    ap.add_argument(
+        "--easyocr-preprocess-contrast",
+        type=float,
+        default=1.25,
+        help="Contrast boost factor applied during OCR preprocessing",
+    )
+    ap.add_argument(
+        "--easyocr-preprocess-unsharp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply an unsharp mask during OCR preprocessing",
+    )
+    ap.add_argument(
+        "--easyocr-preprocess-threshold",
+        type=int,
+        help="Optional binarization threshold (0-255) applied after sharpening/contrast",
+    )
+    ap.add_argument(
+        "--easyocr-korean-postprocess",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply Korean lexicon-based cleanup to OCR text",
+    )
+    ap.add_argument(
+        "--easyocr-korean-lexicon",
+        help="Path to a newline-delimited lexicon used for Korean OCR cleanup",
     )
 
     ap.add_argument(
@@ -4114,6 +4216,27 @@ def main():
         else:
             crop_report_paths = [None] * len(pdfs)
 
+    korean_lexicon: Optional[Sequence[str]] = None
+    if args.easyocr_korean_lexicon:
+        try:
+            with open(
+                os.path.abspath(os.path.expanduser(args.easyocr_korean_lexicon)),
+                "r",
+                encoding="utf-8",
+            ) as fh:
+                korean_lexicon = [line.strip() for line in fh if line.strip()]
+                logger.info(
+                    "Loaded %d lexicon entries from %s",
+                    len(korean_lexicon),
+                    args.easyocr_korean_lexicon,
+                )
+        except OSError as exc:
+            logger.warning(
+                "Failed to load Korean lexicon from %s: %s",
+                args.easyocr_korean_lexicon,
+                exc,
+            )
+
     ocr_settings = OCRSettings(
         dpi=args.easyocr_dpi,
         languages=[lang.strip() for lang in args.easyocr_langs.split(",") if lang.strip()],
@@ -4123,6 +4246,12 @@ def main():
         column_pad_bottom=args.easyocr_column_pad_bottom,
         column_filter_top=args.easyocr_column_filter_top,
         column_filter_bottom=args.easyocr_column_filter_bottom,
+        preprocess_images=args.easyocr_preprocess,
+        preprocess_contrast=args.easyocr_preprocess_contrast,
+        preprocess_unsharp=args.easyocr_preprocess_unsharp,
+        preprocess_threshold=args.easyocr_preprocess_threshold,
+        korean_postprocess=args.easyocr_korean_postprocess,
+        korean_lexicon=korean_lexicon if korean_lexicon is not None else DEFAULT_KOREAN_LEXICON,
     )
 
     for (
